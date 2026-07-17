@@ -1,0 +1,51 @@
+==============================================================
+RansomWall ML — Ket qua danh gia
+==============================================================
+
+!!! CANH BAO: train tren DATASET TONG HOP.
+!!! Cac so duoi day KHONG co gia tri khoa hoc.
+!!! Phai train lai tren mau that truoc khi bao ve.
+
+CONFUSION MATRIX
+                 Du doan BENIGN   Du doan MALWARE
+That BENIGN               1250                 0
+That MALWARE                 0               750
+
+  False Positive (bao dong nham) : 0
+  False Negative (BO SOT)        : 0   <- ton kem nhat
+
+Precision : 1.0000
+Recall    : 1.0000   <- uu tien chi so nay
+F1        : 1.0000
+ROC-AUC   : 1.0000
+CV F1 (5-fold): 1.0000 +/- 0.0000
+
+              precision    recall  f1-score   support
+
+      BENIGN       1.00      1.00      1.00      1250
+     MALWARE       1.00      1.00      1.00       750
+
+    accuracy                           1.00      2000
+   macro avg       1.00      1.00      1.00      2000
+weighted avg       1.00      1.00      1.00      2000
+
+
+FEATURE IMPORTANCE
+--------------------------------------------------------------
+  mean_entropy_delta     0.3058  #############################################################
+  rename_rate            0.2200  ###########################################
+  io_rate                0.1325  ##########################
+  affected_ext_count     0.1311  ##########################
+  honey_modified         0.0635  ############
+  high_entropy           0.0582  ###########
+  fingerprint_mismatch   0.0390  #######
+  ext_changed            0.0221  ####
+  suspicious_strings     0.0108  ##
+  shadow_deleted         0.0105  ##
+  crypto_api             0.0027  
+  safe_mode_disable      0.0018  
+  unsigned               0.0013  
+  high_io                0.0004  
+  packed                 0.0002  
+  dir_enum               0.0000  
+  registry_persist       0.0000  
