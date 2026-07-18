@@ -1,0 +1,72 @@
+;
+; RansomWallDriver.inf — Minifilter installation
+;
+; Cài: chuột phải file này -> Install, rồi:  sc start RansomWallDriver
+;
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = "ActivityMonitor"
+ClassGuid   = {b86dff51-a31e-4bac-b3cf-e8cfe75c9fc2}
+Provider    = %ProviderString%
+DriverVer   = 07/15/2026,4.0.0.0
+CatalogFile = RansomWallDriver.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir          = 12
+MiniFilter.DriverFiles  = 12
+
+[DefaultInstall.NTamd64]
+OptionDesc  = %ServiceDescription%
+CopyFiles   = MiniFilter.DriverFiles
+
+[DefaultInstall.NTamd64.Services]
+AddService  = %ServiceName%,,MiniFilter.Service
+
+[DefaultUninstall.NTamd64]
+DelFiles   = MiniFilter.DriverFiles
+
+[DefaultUninstall.NTamd64.Services]
+DelService = %ServiceName%,0x200
+
+[MiniFilter.Service]
+DisplayName      = %ServiceName%
+Description      = %ServiceDescription%
+ServiceBinary    = %12%\%DriverName%.sys
+Dependencies     = "FltMgr"
+ServiceType      = 2                      ; SERVICE_FILE_SYSTEM_DRIVER
+StartType        = 3                      ; SERVICE_DEMAND_START
+ErrorControl     = 1                      ; SERVICE_ERROR_NORMAL
+LoadOrderGroup   = "FSFilter Activity Monitor"
+AddReg           = MiniFilter.AddRegistry
+
+[MiniFilter.AddRegistry]
+HKR,,"DebugFlags",0x00010001 ,0x0
+HKR,,"SupportedFeatures",0x00010001,0x3
+HKR,"Instances","DefaultInstance",0x00000000,%DefaultInstance%
+HKR,"Instances\"%Instance1.Name%,"Altitude",0x00000000,%Instance1.Altitude%
+HKR,"Instances\"%Instance1.Name%,"Flags",0x00010001,%Instance1.Flags%
+
+[MiniFilter.DriverFiles]
+%DriverName%.sys
+
+[SourceDisksFiles]
+RansomWallDriver.sys = 1,,
+
+[SourceDisksNames]
+1 = %DiskId1%,,,
+
+[Strings]
+ProviderString      = "RansomWall Project"
+ServiceDescription  = "RansomWall Ransomware Protection Minifilter"
+ServiceName         = "RansomWallDriver"
+DriverName          = "RansomWallDriver"
+DiskId1             = "RansomWall Installation Disk"
+
+; Altitude 370010 = nhóm FSFilter Activity Monitor.
+; Với sản phẩm thật phải xin altitude chính thức từ Microsoft.
+DefaultInstance     = "RansomWall Instance"
+Instance1.Name      = "RansomWall Instance"
+Instance1.Altitude  = "370010"
+Instance1.Flags     = 0x0
