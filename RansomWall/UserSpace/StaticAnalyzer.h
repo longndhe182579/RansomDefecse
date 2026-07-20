@@ -369,6 +369,7 @@ namespace rw {
     /* Cụm dài, đặc trưng — không thể trùng ngẫu nhiên */
     inline const std::vector<std::string>& RansomPhrases() {
         static const std::vector<std::string> k = {
+            /* Ransom note phrases — phổ biến nhất */
             "your files have been encrypted",
             "all your files are encrypted",
             "your files are encrypted",
@@ -387,6 +388,44 @@ namespace rw {
             "your network has been",
             "wanadecryptor",
             "@wanadecryptor@",
+
+            /* Dharma/Phobos — hardcode trong binary */
+            "id-[",                         /* naming: file.id-[xxxx].[email].dharma */
+            ".dharma",
+            ".phobos",
+            ".eking",
+            ".acute",
+            ".barak",
+            ".combo",
+            ".java",                        /* Dharma variant */
+            "harma@",                       /* email pattern */
+            "phobos@",
+
+            /* LockBit */
+            "lockbit",
+            "restore-my-files",
+            "!!restore-my-files!!",
+
+            /* Stop/DJVU — đuôi file đặc trưng */
+            ".djvu",
+            /* ".stop" bỏ — quá chung, 7-Zip và nhiều tool có chuỗi này */
+            "openme.txt",
+            "_readme.txt",
+            "restorefiles.txt",
+
+            /* Ryuk */
+            "ryuk",
+            "rypnotes",
+
+            /* Common C2 / ransom note markers */
+            "your personal id",
+            "unique id",
+            "files are locked",
+            "send email",
+            "contact us",                   /* chỉ khi kết hợp với context encrypt */
+            "recovery key",
+            "do not rename encrypted",
+            "do not try to decrypt",
         };
         return k;
     }
@@ -405,14 +444,22 @@ namespace rw {
      */
     inline const std::vector<std::string>& RansomFamilies() {
         static const std::vector<std::string> k = {
+            /* WannaCry */
             "wncry", "wanacry", "wannacry", "wanacrypt", "wncryt",
+            /* Big families */
             "conti", "ryuk", "revil", "sodinokibi", "lockbit", "blackcat",
             "locky", "cerber", "darkside", "cryptolocker", "cryptowall",
             "teslacrypt", "petya", "notpetya", "maze", "egregor", "clop",
             "dharma", "phobos", "stop_djvu", "medusalocker", "avaddon",
             "blackbasta", "royalransom", "akira", "8base",
+            /* Mới */
             "alphv", "royal", "play", "bianlian", "rhysida",
             "meow", "hunters", "scattered", "snatch", "monti",
+            /* Dharma variants — email trong tên file (chỉ các tên ĐẶC TRƯNG) */
+            "arrow", "bip", "combo", "gamma",
+            /* java và adobe bỏ — quá chung chung, SearchProtocolHost.exe cũng chứa */
+            /* Stop/DJVU variants */
+            "djvu", "neer", "nook", "maas", "kuus", "topi", "koom",
         };
         return k;
     }
@@ -608,25 +655,33 @@ namespace rw {
         std::wstring die = dir + cfg::DIE_REL_PATH;
         if (!fs::exists(die)) return -1;
 
-        /*
-         * Tối ưu lệnh DIE cho ARM64:
-         *   --csv   : output ngắn gọn, không format HTML
-         *   -p      : chỉ scan packer/protector, bỏ qua compiler detection
-         * Không dùng --single vì cần match cả database
-         */
-        std::wstring cmd = L"\"" + die + L"\" --csv -p \"" + filePath +
+        std::wstring cmd = L"\"" + die + L"\" -p \"" + filePath +
             L"\" -D \"" + dir + cfg::DIE_DB_REL_PATH + L"\"";
 
         std::string out = ToLowerA(ExecuteAndCapture(cmd, cfg::DIE_TIMEOUT_MS));
         if (out.empty()) return 0;
 
-        static const char* kHits[] = { "packer:", "protector:", "encrypted", "obfuscator:" };
+        /*
+         * DIE có 2 format output tuỳ flag:
+         *   Text (-p):   "PE64 | packer: UPX 3.96"
+         *   CSV (--csv): "PE64,packer,UPX(3.96)[NRV,best]"
+         *
+         * kHits bắt cả 2 format — "packer," khớp CSV, "packer:" khớp text.
+         */
+        static const char* kHits[] = {
+            "packer:", "packer,",          // F2 chính
+            "protector:", "protector,",    // protector = dạng pack đặc biệt
+            "encrypted,", "encrypted:",    // file bị encrypt toàn bộ
+            "obfuscator:", "obfuscator,",  // obfuscator
+            "crypter:", "crypter,",        // crypter thường dùng bởi ransomware
+        };
         for (auto* h : kHits)
             if (out.find(h) != std::string::npos) {
                 size_t p = out.find(h);
-                LOG_I("      -> DIE: %s", out.substr(p, 60).c_str());
+                LOG_I("      -> DIE: %s", out.substr(p, std::min((size_t)80, out.size()-p)).c_str());
                 return 1;
             }
+        LOG_D("      -> DIE: khong phat hien packer (%zu bytes output)", out.size());
         return 0;
     }
 
@@ -643,26 +698,9 @@ namespace rw {
        ====================================================================== */
     inline std::string RunFLOSS(const std::wstring& filePath) {
         std::wstring floss = GetModuleDir() + cfg::FLOSS_REL_PATH;
-        if (!fs::exists(floss)) return "\x01NOTOOL";
+        if (!fs::exists(floss)) return "\x01NOTOOL";   /* sentinel: phân biệt "không có tool" vs "không thấy gì" */
 
-        /*
-         * Giới hạn file size cho FLOSS:
-         * File bị pack nặng (> 10MB) mà FLOSS emulate sẽ rất lâu trên ARM64.
-         * Ransomware thường nhỏ (< 5MB) — file lớn hơn thường là installer lành tính.
-         * Native scan đã xử lý file lớn đủ tốt.
-         */
-        WIN32_FILE_ATTRIBUTE_DATA fad{};
-        if (GetFileAttributesExW(filePath.c_str(), GetFileExInfoStandard, &fad)) {
-            uint64_t sz = ((uint64_t)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
-            if (sz > cfg::FLOSS_MAX_FILE_SIZE) {
-                LOG_D("      (FLOSS bo qua: file %.1f MB > gioi han %.0f MB)",
-                    sz / 1048576.0, cfg::FLOSS_MAX_FILE_SIZE / 1048576.0);
-                return "";   /* xem như không có chuỗi stack */
-            }
-        }
-
-        /* --only stack: chỉ tìm stack strings — nhanh nhất, đủ cho ransom note */
-        std::wstring cmd = L"\"" + floss + L"\" --only stack -- \"" + filePath + L"\"";
+        std::wstring cmd = L"\"" + floss + L"\" --only stack tight decoded -- \"" + filePath + L"\"";
         return ToLowerA(ExecuteAndCapture(cmd, cfg::FLOSS_TIMEOUT_MS));
     }
 
@@ -712,34 +750,25 @@ namespace rw {
 
            File có chữ ký hợp lệ và không có dấu hiệu nào -> bỏ qua external.
            ================================================================== */
-           /*
-            * Điều kiện chạy DIE/FLOSS:
-            * Phải có DẤU HIỆU NỘI DUNG — không phải chỉ thiếu chữ ký (F1).
-            * attrib.exe, conhost.exe, icacls.exe không có chữ ký nhưng nội dung sạch
-            * -> chạy DIE/FLOSS cho chúng = timeout vô nghĩa.
-            *
-            * hasContentHint: native đã thấy packed/cryptoApi/suspStrings
-            * -> DIE có thể confirm thêm, FLOSS có thể bóc stack strings
-            *
-            * Nếu chỉ có F1 (unsigned) mà không có gì khác -> bỏ qua external.
-            * F1 vẫn được tính vào score, không mất điểm.
-            */
-        bool hasContentHint = r.packed || r.cryptoApi || r.suspStrings;
+        bool suspicious = r.unsignedImage || r.packed || r.cryptoApi || r.suspStrings;
 
-        if (!hasContentHint) {
-            LOG_I("[STATIC] %s -> F1=%d nhung noi dung sach — bo qua DIE/FLOSS [%llums]",
-                ws2s(GetFileNameOnly(path)).c_str(), r.unsignedImage, GetTickCount64() - t0);
+        if (!suspicious) {
+            LOG_I("[STATIC] %s -> sach (co chu ky, khong dau hieu) — bo qua DIE/FLOSS [%llums]",
+                ws2s(GetFileNameOnly(path)).c_str(), GetTickCount64() - t0);
             return r;
         }
 
-        /* --- F2: DIE chỉ khi native miss VÀ đã có content hint --- */
-        if (!r.packed && hasContentHint) {
+        /* --- F2: DIE chạy khi F1 bật hoặc đã có content hint
+         * DIE phải chạy TRƯỚC mới biết packed — không thể chờ native detect xong
+         * suspicious = true khi unsigned → DIE vẫn được gọi cho file không ký */
+        if (!r.packed) {
             int die = RunDIE(path);
             if (die == 1)       r.packed = true;
             else if (die == -1) LOG_D("      (khong co diec.exe — chi dung native)");
         }
 
-        /* --- F3: FLOSS chỉ khi native miss VÀ đã có content hint --- */
+        /* --- F3: FLOSS chỉ khi đã có ít nhất 1 dấu hiệu (sau khi DIE chạy) --- */
+        bool hasContentHint = r.packed || r.cryptoApi || r.suspStrings;
         if (!r.suspStrings && hasContentHint) {
             std::string fl = RunFLOSS(path);
             if (fl == "\x01NOTOOL") {
