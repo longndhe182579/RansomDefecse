@@ -55,7 +55,7 @@
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
-      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)..\Common;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)UserSpace;$(ProjectDir)Common;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
@@ -85,19 +85,19 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="main.cpp" />
+    <ClCompile Include="UserSpace\main.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="Config.h" />
-    <ClInclude Include="RwProtocol.h" />
-    <ClInclude Include="Util.h" />
-    <ClInclude Include="Features.h" />
-    <ClInclude Include="FilterClient.h" />
-    <ClInclude Include="CowEngine.h" />
-    <ClInclude Include="StaticAnalyzer.h" />
-    <ClInclude Include="HoneyFiles.h" />
-    <ClInclude Include="MLClient.h" />
-    <ClInclude Include="Cleanup.h" />
+    <ClInclude Include="UserSpace\Config.h" />
+    <ClInclude Include="Common\RwProtocol.h" />
+    <ClInclude Include="UserSpace\Util.h" />
+    <ClInclude Include="UserSpace\Features.h" />
+    <ClInclude Include="UserSpace\FilterClient.h" />
+    <ClInclude Include="UserSpace\CowEngine.h" />
+    <ClInclude Include="UserSpace\StaticAnalyzer.h" />
+    <ClInclude Include="UserSpace\HoneyFiles.h" />
+    <ClInclude Include="UserSpace\MLClient.h" />
+    <ClInclude Include="UserSpace\Cleanup.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />
