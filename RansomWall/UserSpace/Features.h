@@ -167,6 +167,7 @@ namespace rw {
         Latch f11_extChanged;
         Latch f12_fingerprintMismatch;
         Latch f13_highEntropy;
+        Latch f14_daa;             /* F14 Differential Area Analysis (Davies 2021) */
 
         /* ---- Counter theo tốc độ ---- */
         SlidingCounter ioOps;
@@ -222,7 +223,9 @@ namespace rw {
             return false;
         }
 
-        /* Feature vector 13 chiều F1-F13 — đúng theo bài báo Shaukat & Ribeiro 2018 */
+        /* Feature vector 14 chiều F1-F14
+           F1-F13: Shaukat & Ribeiro, COMSNETS 2018
+           F14:    Davies et al., arXiv:2106.14418, 2021 (DAA) */
         std::string ToJson() {
             JsonW j;
             j.Begin()
@@ -240,6 +243,7 @@ namespace rw {
                 .Bool01("ext_changed", f11_extChanged.value)
                 .Bool01("fingerprint_mismatch", f12_fingerprintMismatch.value)
                 .Bool01("high_entropy", f13_highEntropy.value)
+                .Bool01("daa_encrypted", f14_daa.value)
                 .End();
             return j.Get();
         }

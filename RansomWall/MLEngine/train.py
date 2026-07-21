@@ -30,6 +30,7 @@ FEATURE_NAMES = [
     'ext_changed',          # F11 Dynamic
     'fingerprint_mismatch', # F12 Dynamic
     'high_entropy',         # F13 Dynamic
+    'daa_encrypted',        # F14 Differential Area Analysis (Davies 2021)
 ]
 
 NUM_RANSOMWARE = 574
@@ -43,23 +44,24 @@ def gen_ransomware():
             np.random.choice([0,1], p=[0.05,0.95]),  # F1
             np.random.choice([0,1], p=[0.10,0.90]),  # F2
             np.random.choice([0,1], p=[0.10,0.90]),  # F3
-            np.random.choice([0,1], p=[0.02,0.98]),  # F4 honey — rất mạnh
-            np.random.choice([0,1], p=[0.20,0.80]),  # F5 crypto api
-            np.random.choice([0,1], p=[0.50,0.50]),  # F6 safe mode
-            np.random.choice([0,1], p=[0.05,0.95]),  # F7 shadow
-            np.random.choice([0,1], p=[0.40,0.60]),  # F8 registry
+            np.random.choice([0,1], p=[0.02,0.98]),  # F4
+            np.random.choice([0,1], p=[0.20,0.80]),  # F5
+            np.random.choice([0,1], p=[0.50,0.50]),  # F6
+            np.random.choice([0,1], p=[0.05,0.95]),  # F7
+            np.random.choice([0,1], p=[0.40,0.60]),  # F8
             np.random.choice([0,1], p=[0.05,0.95]),  # F9
             np.random.choice([0,1], p=[0.05,0.95]),  # F10
             np.random.choice([0,1], p=[0.05,0.95]),  # F11
             np.random.choice([0,1], p=[0.05,0.95]),  # F12
             np.random.choice([0,1], p=[0.05,0.95]),  # F13
+            np.random.choice([0,1], p=[0.02,0.98]),  # F14 DAA
         ]
     elif rtype == 'stealthy':
         return [
             np.random.choice([0,1], p=[0.15,0.85]),
             np.random.choice([0,1], p=[0.30,0.70]),
             np.random.choice([0,1], p=[0.40,0.60]),
-            np.random.choice([0,1], p=[0.10,0.90]),  # F4 vẫn chạm honey
+            np.random.choice([0,1], p=[0.10,0.90]),
             np.random.choice([0,1], p=[0.40,0.60]),
             np.random.choice([0,1], p=[0.70,0.30]),
             np.random.choice([0,1], p=[0.40,0.60]),
@@ -69,6 +71,7 @@ def gen_ransomware():
             np.random.choice([0,1], p=[0.20,0.80]),
             np.random.choice([0,1], p=[0.20,0.80]),
             np.random.choice([0,1], p=[0.15,0.85]),
+            np.random.choice([0,1], p=[0.08,0.92]),  # F14
         ]
     else:  # partial
         return [
@@ -85,7 +88,9 @@ def gen_ransomware():
             np.random.choice([0,1], p=[0.50,0.50]),
             np.random.choice([0,1], p=[0.30,0.70]),
             np.random.choice([0,1], p=[0.30,0.70]),
+            np.random.choice([0,1], p=[0.15,0.85]),  # F14
         ]
+
 
 def gen_benign():
     btype = np.random.choice(['trusted','unsigned_clean','noisy'], p=[0.5,0.3,0.2])
@@ -95,46 +100,51 @@ def gen_benign():
             np.random.choice([0,1], p=[0.98,0.02]),
             np.random.choice([0,1], p=[0.99,0.01]),
             0,  # F4 honey — KHÔNG BAO GIỜ
-            np.random.choice([0,1], p=[0.80,0.20]),  # F5 browser/VPN ok
+            np.random.choice([0,1], p=[0.80,0.20]),
             0,  # F6
             0,  # F7
-            np.random.choice([0,1], p=[0.92,0.08]),  # F8 installer ok
+            np.random.choice([0,1], p=[0.92,0.08]),
             np.random.choice([0,1], p=[0.70,0.30]),
             np.random.choice([0,1], p=[0.80,0.20]),
             0,  # F11
             np.random.choice([0,1], p=[0.90,0.10]),
             np.random.choice([0,1], p=[0.98,0.02]),
+            np.random.choice([0,1], p=[0.99,0.01]),  # F14 DAA — benign hiếm bật
         ]
     elif btype == 'unsigned_clean':
         return [
-            np.random.choice([0,1], p=[0.20,0.80]),
-            np.random.choice([0,1], p=[0.60,0.40]),
-            np.random.choice([0,1], p=[0.90,0.10]),
-            0,  # F4
-            np.random.choice([0,1], p=[0.70,0.30]),
-            0, 0,
-            np.random.choice([0,1], p=[0.85,0.15]),
-            np.random.choice([0,1], p=[0.50,0.50]),
-            np.random.choice([0,1], p=[0.60,0.40]),
-            0,
-            np.random.choice([0,1], p=[0.70,0.30]),
-            np.random.choice([0,1], p=[0.85,0.15]),
+            np.random.choice([0,1], p=[0.20,0.80]),  # F1
+            np.random.choice([0,1], p=[0.60,0.40]),  # F2
+            np.random.choice([0,1], p=[0.90,0.10]),  # F3
+            0,                                        # F4 honey
+            np.random.choice([0,1], p=[0.70,0.30]),  # F5 crypto_api
+            0,                                        # F6
+            0,                                        # F7
+            np.random.choice([0,1], p=[0.85,0.15]),  # F8
+            np.random.choice([0,1], p=[0.50,0.50]),  # F9
+            np.random.choice([0,1], p=[0.60,0.40]),  # F10
+            0,                                        # F11
+            np.random.choice([0,1], p=[0.70,0.30]),  # F12
+            np.random.choice([0,1], p=[0.85,0.15]),  # F13
+            np.random.choice([0,1], p=[0.99,0.01]),  # F14 DAA
         ]
-    else:  # noisy — antivirus, indexer
+    else:  # noisy
         return [
             np.random.choice([0,1], p=[0.80,0.20]),
             np.random.choice([0,1], p=[0.95,0.05]),
             np.random.choice([0,1], p=[0.95,0.05]),
-            0,  # F4 honey — KHÔNG BAO GIỜ
+            0,  # F4
             np.random.choice([0,1], p=[0.60,0.40]),
             0, 0,
             np.random.choice([0,1], p=[0.90,0.10]),
-            np.random.choice([0,1], p=[0.20,0.80]),  # F9 dir_enum cao
-            np.random.choice([0,1], p=[0.20,0.80]),  # F10 high_io cao
-            0,  # F11 ext_changed — KHÔNG
+            np.random.choice([0,1], p=[0.20,0.80]),
+            np.random.choice([0,1], p=[0.20,0.80]),
+            0,
             np.random.choice([0,1], p=[0.60,0.40]),
             np.random.choice([0,1], p=[0.90,0.10]),
+            np.random.choice([0,1], p=[0.98,0.02]),  # F14
         ]
+
 
 # ── Sinh dataset ──────────────────────────────────────────────────────────────
 print("=" * 65)
@@ -177,13 +187,14 @@ model.fit(X, y)
 print(classification_report(y, model.predict(X), target_names=['Benign','Ransomware']))
 
 # ── Test case từ log WannaCry thực tế ────────────────────────────────────────
-print("[+] Test case thuc te (vector tu log WannaCry):")
+print("[+] Test case thuc te (vector tu log WannaCry + Cerber):")
 test_cases = [
-    ([1,1,1,0,0,0,0,0,1,1,0,1,1], "WannaCry score=6 (lan 1)"),
-    ([1,1,1,0,0,0,0,0,1,1,0,1,1], "WannaCry score=7 (lan 2)"),
-    ([1,1,1,1,0,0,1,0,1,1,1,1,1], "WannaCry aggressive (honey+shadow)"),
-    ([1,0,0,0,0,0,0,0,1,1,0,0,0], "7-Zip/indexer (BENIGN)"),
-    ([0,0,0,0,1,0,0,0,0,1,0,0,0], "Browser/VPN (BENIGN)"),
+    ([1,1,1,0,0,0,0,0,1,1,0,1,1,1], "WannaCry score=7 (F14 bat)"),
+    ([1,1,1,0,0,0,0,0,1,1,0,1,1,0], "WannaCry score=6 (F14 chua bat)"),
+    ([1,1,1,1,0,0,1,0,1,1,1,1,1,1], "WannaCry aggressive (honey+shadow+F14)"),
+    ([1,0,1,0,1,1,1,1,1,1,1,0,0,1], "Stop/DJVU (F14 bat)"),
+    ([1,0,0,0,0,0,0,0,1,1,0,0,0,0], "7-Zip/indexer (BENIGN)"),
+    ([0,0,0,0,1,0,0,0,0,1,0,0,0,0], "Browser/VPN (BENIGN)"),
 ]
 for feat, label in test_cases:
     prob = model.predict_proba([feat])[0][1]
@@ -191,4 +202,4 @@ for feat, label in test_cases:
     print(f"   prob={prob:.3f} -> {dec:7s} | {label}")
 
 joblib.dump(model, 'model.pkl')
-print("\n[SUCCESS] Da luu model.pkl (13 features, dung bai bao)")
+print("\n[SUCCESS] Da luu model.pkl (14 features: F1-F13 + F14 DAA)")

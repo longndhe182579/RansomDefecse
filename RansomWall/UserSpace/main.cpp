@@ -13,6 +13,11 @@
  *
  * HAI NHÁNH ĐỘC LẬP VỀ ĐIỀU KHIỂN, CỘNG HƯỞNG VỀ DỮ LIỆU:
  *   CoW lưu entropy_before/magic_before -> F12/F13 dùng lại MIỄN PHÍ.
+ *
+ * SỬA LỖI (F4 honey không bao giờ bắn):
+ *   Nhánh IsPending return sớm sau CoW -> toàn bộ Dynamic Analysis (gồm F4)
+ *   không tới lượt cho first-touch. Tách honey tripwire (CheckHoneyTouch)
+ *   chạy TRƯỚC CoW trong nhánh IsPending.
  */
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -92,6 +97,29 @@ static ProcessFeature& EnsurePf(DWORD pid, DWORD rootPid) {   /* gọi DƯỚI l
         pf.createdAt = Clock::now();
     }
     return pf;
+}
+
+/*
+ * CheckHoneyTouch — Honey tripwire, PHẢI chạy được cả khi IRP đang pend.
+ *
+ * Nhánh IsPending trong OnEvent return sớm sau CoW nên khối F4 trong Dynamic
+ * Analysis KHÔNG BAO GIỜ tới lượt cho first-touch. Tách ra đây để honey luôn
+ * được kiểm, độc lập với nhánh dynamic.
+ *
+ * Trả về true nếu honey vừa bị chạm bởi tiến trình KHÔNG whitelist.
+ * Gọi KHÔNG dưới g_Mtx (tự lock bên trong).
+ */
+static bool CheckHoneyTouch(DWORD pid, DWORD root, const std::wstring& path) {
+    if (!g_Honey.IsHoney(path)) return false;
+    if (HoneyFiles::IsWhitelisted(pid)) {
+        LOG_D("      Honey bi cham boi tien trinh whitelist -> bo qua");
+        return false;
+    }
+    std::lock_guard<std::mutex> lk(g_Mtx);
+    auto& pf = EnsurePf(root, root);
+    pf.Raise(pf.f4_honeyModified, "F4 honey file bi sua doi");
+    LOG_I("      honey: %s", ws2s(GetFileNameOnly(path)).c_str());
+    return true;
 }
 
 /* Áp kết quả tĩnh vào một PID — gọi DƯỚI lock */
@@ -609,7 +637,12 @@ static ULONG OnEvent(const RW_EVENT& ev) {
        Không chờ điểm. Không gọi ML. Không phụ thuộc Flask.
        ===================================================================== */
     if (ev.IsPending) {
+        /* Honey tripwire chạy TRƯỚC — nhánh này vốn return sớm nên khối F4
+           trong Dynamic Analysis không bao giờ tới lượt cho first-touch. */
+        CheckHoneyTouch(pid, root, path);
+
         g_Cow->OnFirstTouch(pid, path, root);   /* root để đăng ký entry vào RootPid */
+        MaybeCallML(root);   /* F4 vừa bật -> cho ML cơ hội nếu đủ ngưỡng */
         return RwReplyContinue;      /* <<< KẾT THÚC. Nhánh này không đi đâu nữa. */
     }
 
@@ -712,13 +745,33 @@ static ULONG OnEvent(const RW_EVENT& ev) {
                     }
                 }
             }
+
+            /*
+             * F14 — Differential Area Analysis (Davies et al., arXiv:2106.14418)
+             *
+             * Tính trên MỖI FILE lần đầu bị ghi — đúng theo thiết kế bài báo.
+             * Ransomware tạo file mã hoá mới → DAA thấp → cộng điểm.
+             *
+             * Tránh lag: chỉ tính trên VALUABLE_EXTS và dùng IsPending
+             * (CoW đã pend IRP → file chưa bị ghi → đọc được nội dung mã hoá thật).
+             * Mỗi file chỉ tính 1 lần nhờ FirstTouchTable của kernel.
+             * Nếu F14 đã bật thì dừng — không cần tính thêm.
+             */
+            if (!pf.f14_daa.value && cfg::VALUABLE_EXTS.count(ext)) {
+                double daa = DifferentialAreaAnalysis(path);
+                if (daa < cfg::DAA_THRESHOLD) {
+                    LOG_D("      F14: DAA=%.2f Bit-Bytes  %s",
+                        daa, ws2s(GetFileNameOnly(path)).c_str());
+                    pf.Raise(pf.f14_daa, "F14 DAA: header ngau nhien (ma hoa AES)");
+                }
+            }
         }
 
         if (pf.totalScore >= cfg::SCORE_FREEZE && !pf.backupFrozen)
             pf.backupFrozen = true;
 
         if (pf.totalScore >= 4 && pf.totalScore < cfg::SCORE_ML_TRIGGER)
-            LOG_W("[DANGER] PID=%lu score=%d/13 — vung nguy hiem, tiep tuc theo doi.",
+            LOG_W("[DANGER] PID=%lu score=%d/14 — vung nguy hiem, tiep tuc theo doi.",
                 root, pf.totalScore);
     }
 

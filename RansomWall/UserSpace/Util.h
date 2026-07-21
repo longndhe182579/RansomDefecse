@@ -118,7 +118,7 @@ namespace rw {
     private:
         std::mutex m_;
         LogLevel   min_ = LogLevel::Info;
-        FILE*      f_   = nullptr;
+        FILE* f_ = nullptr;
 
         static const char* Tag(LogLevel lv) {
             switch (lv) {
@@ -156,9 +156,9 @@ namespace rw {
 #define LOG_E(...) rw::Logger::I().Log(rw::LogLevel::Error, __VA_ARGS__)
 #define LOG_A(...) rw::Logger::I().Log(rw::LogLevel::Alert, __VA_ARGS__)
 
-/* ======================================================================
-   ENTROPY
-   ====================================================================== */
+    /* ======================================================================
+       ENTROPY
+       ====================================================================== */
     inline double CalculateEntropy(const uint8_t* data, size_t size) {
         if (size == 0) return 0.0;
         size_t cnt[256] = {};
@@ -232,11 +232,11 @@ namespace rw {
        (Davies et al. Table 7)
        ====================================================================== */
 
-    /*
-     * kRandCurve — entropy của file chứa pure random bytes tại 8..256 byte.
-     * Tính trước từ os.urandom(1000 files) theo Algorithm 1 của bài báo.
-     * Index i → entropy tại (i+1)*8 byte.
-     */
+       /*
+        * kRandCurve — entropy của file chứa pure random bytes tại 8..256 byte.
+        * Tính trước từ os.urandom(1000 files) theo Algorithm 1 của bài báo.
+        * Index i → entropy tại (i+1)*8 byte.
+        */
     inline const double* GetRandCurve() {
         static const double kRandCurve[32] = {
             2.976, 3.941, 4.496, 4.878, 5.171, 5.418, 5.633, 5.820,
@@ -488,7 +488,7 @@ namespace rw {
 
         /* Leo ngược, tìm tổ tiên gần nhất có trong watchedPids */
         DWORD best = 0;
-        DWORD cur  = pid;
+        DWORD cur = pid;
         for (int depth = 0; depth < maxDepth; depth++) {
             auto it = parentOf.find(cur);
             if (it == parentOf.end() || it->second == 0 || it->second == cur) break;

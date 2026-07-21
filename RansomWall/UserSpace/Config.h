@@ -77,7 +77,8 @@ namespace rw::cfg {
 
     /* ---------- Entropy (mục 5.2) ---------- */
     constexpr double ENTROPY_DELTA_THRESHOLD = 2.0;   // F13: ΔH
-    constexpr double ENTROPY_ABS_THRESHOLD = 6.5;   // F13: H sau (6.5 bắt AES-CBC nhẹ, partial encryption)
+    constexpr double ENTROPY_ABS_THRESHOLD = 6.5;   // F13
+    constexpr double DAA_THRESHOLD = 56.0;           // F14: 56 Bit-Bytes (Davies 2021, Table 7)   // F13: H sau (6.5 bắt AES-CBC nhẹ, partial encryption)
     constexpr double ENTROPY_PACKED_SECTION = 7.0;   // F2:  section thực thi
     constexpr size_t ENTROPY_SAMPLE_BYTES = 4096;  // F12/F13 đọc 4KB, KHÔNG phải 16 byte
 
@@ -112,8 +113,8 @@ namespace rw::cfg {
     inline const std::wstring DIE_DB_REL_PATH = L"\\die\\db";
     inline const std::wstring FLOSS_REL_PATH = L"\\floss.exe";
 
-    constexpr DWORD  DIE_TIMEOUT_MS = 15000;  // tăng từ 5s -> 15s cho ARM64 emulation
-    constexpr DWORD  FLOSS_TIMEOUT_MS = 30000;   // tăng từ 20s -> 30s cho ARM64
+    constexpr DWORD  DIE_TIMEOUT_MS = 8000;
+    constexpr DWORD  FLOSS_TIMEOUT_MS = 15000;
     constexpr size_t TOOL_MAX_OUTPUT = 8 * 1024 * 1024;
     constexpr uint64_t FLOSS_MAX_FILE_SIZE = 10ull * 1024 * 1024;  // file > 10MB bỏ qua FLOSS
 
@@ -126,7 +127,7 @@ namespace rw::cfg {
        /* Thời gian chờ file ghi xong trước khi quét.
           120s: gõ mật khẩu zip, giải nén file lớn, copy qua mạng, VM emulated...
           Chờ trên thread nền nên không tốn gì; timeout ngắn thì MẤT file. */
-    constexpr int    NEWEXE_SETTLE_TIMEOUT_MS = 120000;
+    constexpr int    NEWEXE_SETTLE_TIMEOUT_MS = 30000;
     constexpr uint64_t NEWEXE_MAX_SIZE = 200ull * 1024 * 1024;
 
     /* Thư mục hệ thống: KHÔNG quét tĩnh nếu file có chữ ký hợp lệ.

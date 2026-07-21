@@ -49,7 +49,7 @@ logging.basicConfig(
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "model.pkl")
 
 # ── Thứ tự vector 15 chiều — PHẢI khớp với train.py và Features.h::ToJson ──
-# 13 features F1-F13 đúng theo bài báo Shaukat & Ribeiro, COMSNETS 2018
+# 14 features: F1-F13 (Shaukat & Ribeiro 2018) + F14 DAA (Davies 2021)
 FEATURE_ORDER = [
     "unsigned",             # F1  Static
     "packed",               # F2  Static
@@ -64,6 +64,7 @@ FEATURE_ORDER = [
     "ext_changed",          # F11 Dynamic
     "fingerprint_mismatch", # F12 Dynamic
     "high_entropy",         # F13 Dynamic
+    "daa_encrypted",        # F14 Differential Area Analysis (Davies 2021)
 ]
 
 N_FEATURES = len(FEATURE_ORDER)  # = 15

@@ -678,7 +678,7 @@ namespace rw {
         for (auto* h : kHits)
             if (out.find(h) != std::string::npos) {
                 size_t p = out.find(h);
-                LOG_I("      -> DIE: %s", out.substr(p, std::min((size_t)80, out.size()-p)).c_str());
+                LOG_I("      -> DIE: %s", out.substr(p, std::min((size_t)80, out.size() - p)).c_str());
                 return 1;
             }
         LOG_D("      -> DIE: khong phat hien packer (%zu bytes output)", out.size());
