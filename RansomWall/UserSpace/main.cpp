@@ -1032,6 +1032,9 @@ int wmain() {
     SetConsoleCP(CP_UTF8);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
+    /* Ghi log ra file song song console — flush chỉ khi WARN/ERROR/ALERT */
+    rw::Logger::I().SetLogFile(GetModuleDir() + L"\\ransomwall.log");
+
     printf("\n");
     printf("  ==========================================\n");
     printf("        RansomWall v4.0\n");

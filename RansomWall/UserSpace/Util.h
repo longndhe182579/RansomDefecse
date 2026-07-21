@@ -82,6 +82,15 @@ namespace rw {
     public:
         static Logger& I() { static Logger l; return l; }
 
+        /* Gọi một lần lúc khởi động để bật ghi file */
+        void SetLogFile(const std::wstring& path) {
+            std::lock_guard<std::mutex> lock(m_);
+            if (f_) { fclose(f_); f_ = nullptr; }
+            /* Dùng "a" thuần — không kèm ccs= để tránh CRT assertion trên Debug ARM64.
+             * Log ghi UTF-8 thủ công vì printf đã SetConsoleOutputCP(CP_UTF8). */
+            _wfopen_s(&f_, path.c_str(), L"a");
+        }
+
         void Log(LogLevel lv, const char* fmt, ...) {
             char buf[2048];
             va_list ap; va_start(ap, fmt);
@@ -89,16 +98,27 @@ namespace rw {
             va_end(ap);
 
             std::lock_guard<std::mutex> lock(m_);
+            auto stamp = Stamp();
+
+            /* Console — có màu */
             SetColor(lv);
-            printf("[%s] %s %s\n", Stamp().c_str(), Tag(lv), buf);
+            printf("[%s] %s %s\n", stamp.c_str(), Tag(lv), buf);
             SetColor(LogLevel::Info);
             fflush(stdout);
+
+            /* File — không màu, không flush mỗi dòng */
+            if (f_) {
+                fprintf(f_, "[%s] %s %s\n", stamp.c_str(), Tag(lv), buf);
+                /* Chỉ flush khi ALERT/ERROR để đảm bảo log quan trọng không mất */
+                if (lv >= LogLevel::Warn) fflush(f_);
+            }
         }
         void SetMinLevel(LogLevel lv) { min_ = lv; }
 
     private:
         std::mutex m_;
         LogLevel   min_ = LogLevel::Info;
+        FILE*      f_   = nullptr;
 
         static const char* Tag(LogLevel lv) {
             switch (lv) {
@@ -136,9 +156,9 @@ namespace rw {
 #define LOG_E(...) rw::Logger::I().Log(rw::LogLevel::Error, __VA_ARGS__)
 #define LOG_A(...) rw::Logger::I().Log(rw::LogLevel::Alert, __VA_ARGS__)
 
-    /* ======================================================================
-       ENTROPY
-       ====================================================================== */
+/* ======================================================================
+   ENTROPY
+   ====================================================================== */
     inline double CalculateEntropy(const uint8_t* data, size_t size) {
         if (size == 0) return 0.0;
         size_t cnt[256] = {};
@@ -184,6 +204,84 @@ namespace rw {
         std::ostringstream os;
         for (uint8_t c : b) os << std::hex << std::setw(2) << std::setfill('0') << (int)c;
         return os.str();
+    }
+
+
+    /* ======================================================================
+       DIFFERENTIAL AREA ANALYSIS (DAA)
+       Davies et al., "Differential Area Analysis for Ransomware Attack
+       Detection within Mixed File Datasets", arXiv:2106.14418, 2021.
+
+       Đo độ tương đồng giữa entropy curve của header file với đường chuẩn
+       của dữ liệu ngẫu nhiên thuần túy (random data reference curve).
+
+       Phương pháp:
+         1. Đọc 256 byte đầu file
+         2. Tính Shannon entropy tại 32 điểm (8,16,24...256 byte)
+         3. Tính diện tích chênh lệch giữa curve file và random curve
+            bằng Composite Trapezoidal Rule
+         4. Diện tích nhỏ → gần random → khả năng cao bị mã hoá
+
+       Ưu điểm so với F13 (ΔH):
+         - Không cần CoW baseline (entropy_before)
+         - Phân biệt được file nén vs file mã hoá (ZIP header thấp, AES header cao)
+         - Bắt được file mới tạo ra (Cerber, LockBit) ngay lập tức
+         - Chỉ đọc 256 byte → nhanh hơn 1000x so với full-file entropy
+
+       Ngưỡng 56 Bit-Bytes tại 256 byte header cho accuracy 99.96%
+       (Davies et al. Table 7)
+       ====================================================================== */
+
+    /*
+     * kRandCurve — entropy của file chứa pure random bytes tại 8..256 byte.
+     * Tính trước từ os.urandom(1000 files) theo Algorithm 1 của bài báo.
+     * Index i → entropy tại (i+1)*8 byte.
+     */
+    inline const double* GetRandCurve() {
+        static const double kRandCurve[32] = {
+            2.976, 3.941, 4.496, 4.878, 5.171, 5.418, 5.633, 5.820,
+            5.985, 6.130, 6.259, 6.373, 6.475, 6.567, 6.650, 6.724,
+            6.791, 6.852, 6.907, 6.957, 7.003, 7.045, 7.084, 7.119,
+            7.152, 7.182, 7.210, 7.236, 7.261, 7.283, 7.305, 7.325
+        };
+        return kRandCurve;
+    }
+
+    /*
+     * DifferentialAreaAnalysis — trả về diện tích Bit-Bytes.
+     * Giá trị thấp → header ngẫu nhiên → khả năng cao bị mã hoá bởi ransomware.
+     * Ngưỡng khuyến nghị: < 56 Bit-Bytes (Davies et al., header 256 byte).
+     * Trả về 9999.0 nếu không đọc được file.
+     */
+    inline double DifferentialAreaAnalysis(const std::wstring& path) {
+        auto buf = ReadHead(path, 256);
+        if (buf.size() < 32) return 9999.0;   /* quá ngắn để phân tích */
+
+        const double* kRand = GetRandCurve();
+
+        /* Tính entropy tại 32 điểm: 8, 16, 24 ... 256 byte */
+        double fileCurve[32] = {};
+        for (int i = 0; i < 32; i++) {
+            size_t len = (size_t)(i + 1) * 8;
+            if (len > buf.size()) len = buf.size();
+            fileCurve[i] = CalculateEntropy(buf.data(), len);
+        }
+
+        /* Curve chênh lệch = random - file */
+        double diff[32] = {};
+        for (int i = 0; i < 32; i++)
+            diff[i] = kRand[i] - fileCurve[i];
+
+        /*
+         * Composite Trapezoidal Rule với h=8 (bước đều):
+         * I = h/2 * [diff[0] + 2*Σdiff[1..30] + diff[31]]
+         */
+        double area = diff[0] + diff[31];
+        for (int i = 1; i < 31; i++) area += 2.0 * diff[i];
+        area *= 4.0;   /* h/2 = 8/2 = 4 */
+
+        /* Lấy giá trị tuyệt đối — diện tích luôn dương */
+        return area < 0 ? -area : area;
     }
 
     /* ======================================================================
@@ -358,11 +456,10 @@ namespace rw {
      * GetRootPidFromTree — leo ngược cây tiến trình Windows thật (qua Toolhelp),
      * tìm tổ tiên GẦN NHẤT có mặt trong tập watchedPids.
      *
-     * Dùng khi ev.RootPid == 0 (RansomWall khởi động SAU ransomware nên
-     * PT table kernel trống, không biết ai sinh ra ai).
+     * Nếu watchedPids rỗng → trả về parent trực tiếp của pid (dùng cho
+     * fallback khi g_Collector chưa có entry cho tiến trình cha).
      *
-     * maxDepth = 8: đủ cho chuỗi ransomware -> cmd -> vssadmin (3 cấp),
-     * không quá lớn để tránh vòng lặp do PID reuse.
+     * maxDepth = 8: đủ cho chuỗi ransomware -> cmd -> vssadmin (3 cấp).
      */
     inline DWORD GetRootPidFromTree(DWORD pid,
         const std::vector<DWORD>& watchedPids,
@@ -381,9 +478,17 @@ namespace rw {
             CloseHandle(snap);
         }
 
+        /* Khi watchedPids rỗng: trả về parent trực tiếp */
+        if (watchedPids.empty()) {
+            auto it = parentOf.find(pid);
+            if (it != parentOf.end() && it->second > 4)
+                return it->second;
+            return 0;
+        }
+
         /* Leo ngược, tìm tổ tiên gần nhất có trong watchedPids */
         DWORD best = 0;
-        DWORD cur = pid;
+        DWORD cur  = pid;
         for (int depth = 0; depth < maxDepth; depth++) {
             auto it = parentOf.find(cur);
             if (it == parentOf.end() || it->second == 0 || it->second == cur) break;
@@ -391,9 +496,9 @@ namespace rw {
             for (DWORD w : watchedPids) {
                 if (w == cur) { best = cur; break; }
             }
-            if (best) break;   /* tìm thấy rồi, dừng */
+            if (best) break;
         }
-        return best;   /* 0 = không tìm thấy tổ tiên nào đang bị theo dõi */
+        return best;
     }
 
     /* ======================================================================
