@@ -78,6 +78,27 @@ namespace rw {
        ====================================================================== */
     enum class LogLevel { Debug, Info, Warn, Error, Alert };
 
+    /* ======================================================================
+       LOGGER  v4.5
+       ======================================================================
+       [FIX 19] BA VẤN ĐỀ CỦA BẢN CŨ:
+
+       1. min_ KHÔNG BAO GIỜ ĐƯỢC KIỂM TRA trong Log() -> SetMinLevel() vô
+          tác dụng, mọi dòng DEBUG đều in ra console.
+
+       2. Không tách mức console và file. Console cần gọn để người dùng theo
+          dõi; file cần đầy đủ để phân tích sau.
+
+       3. Không gộp dòng lặp. Đo được: 109 dòng "Honey bi cham boi tien trinh
+          whitelist" liên tiếp khi Search Indexer quét 110 honey file mới tạo.
+          Cộng thêm hàng trăm dòng [PROC] ... -> tra cay.
+
+       GIẢI PHÁP:
+         - ConsoleLevel mặc định Info, FileLevel mặc định Debug
+           -> console sạch, file vẫn đủ dữ liệu
+         - Gộp dòng LẶP LIÊN TIẾP giống hệt nhau thành 1 dòng + "(x N)"
+         - LOG_T(ms, ...) cho thông điệp biết trước là ồn
+       ====================================================================== */
     class Logger {
     public:
         static Logger& I() { static Logger l; return l; }
@@ -92,33 +113,129 @@ namespace rw {
         }
 
         void Log(LogLevel lv, const char* fmt, ...) {
+            /* Dưới cả hai ngưỡng -> khỏi format, tiết kiệm CPU trên đường nóng */
+            if (lv < consoleLv_ && lv < fileLv_) return;
+
             char buf[2048];
             va_list ap; va_start(ap, fmt);
             vsnprintf(buf, sizeof(buf), fmt, ap);
             va_end(ap);
 
             std::lock_guard<std::mutex> lock(m_);
+
+            /* ---- Gộp dòng lặp liên tiếp ---- */
+            if (lastMsg_ == buf && lastLv_ == lv) {
+                repeat_++;
+                return;                       /* nuốt, đếm lại */
+            }
+            FlushRepeat();                    /* xả bộ đếm của thông điệp trước */
+            lastMsg_ = buf;
+            lastLv_ = lv;
+
+            Emit(lv, buf);
+        }
+
+        /*
+         * LogThrottled — chỉ in tối đa 1 lần mỗi periodMs cho cùng một 'key'.
+         * Dùng cho thông điệp biết trước là ồn nhưng vẫn muốn thấy thỉnh thoảng.
+         * key nên là chuỗi hằng (địa chỉ tĩnh), ví dụ __FUNCTION__ hoặc nhãn riêng.
+         */
+        void LogThrottled(LogLevel lv, const char* key, unsigned periodMs,
+            const char* fmt, ...) {
+            if (lv < consoleLv_ && lv < fileLv_) return;
+
+            uint64_t now = GetTickCount64();
+            {
+                std::lock_guard<std::mutex> lock(m_);
+                auto it = throttle_.find(key);
+                if (it != throttle_.end()) {
+                    if (now - it->second.last < periodMs) { it->second.skipped++; return; }
+                    /* Đã qua chu kỳ — báo luôn số lần bị nuốt */
+                    if (it->second.skipped > 0) {
+                        char note[128];
+                        snprintf(note, sizeof(note),
+                            "  (da bo qua %llu dong tuong tu trong %ums qua)",
+                            it->second.skipped, periodMs);
+                        FlushRepeat();
+                        Emit(LogLevel::Debug, note);
+                        it->second.skipped = 0;
+                    }
+                    it->second.last = now;
+                }
+                else {
+                    throttle_[key] = { now, 0 };
+                }
+            }
+
+            char buf[2048];
+            va_list ap; va_start(ap, fmt);
+            vsnprintf(buf, sizeof(buf), fmt, ap);
+            va_end(ap);
+
+            std::lock_guard<std::mutex> lock(m_);
+            FlushRepeat();
+            lastMsg_ = buf;
+            lastLv_ = lv;
+            Emit(lv, buf);
+        }
+
+        /* Mặc định: console gọn (Info), file đầy đủ (Debug).
+           Muốn console im hơn nữa: SetConsoleLevel(LogLevel::Warn) */
+        void SetConsoleLevel(LogLevel lv) { consoleLv_ = lv; }
+        void SetFileLevel(LogLevel lv) { fileLv_ = lv; }
+
+        /* Giữ tương thích với code cũ — đặt cả hai */
+        void SetMinLevel(LogLevel lv) { consoleLv_ = lv; fileLv_ = lv; }
+
+        /* Gọi trước khi thoát để không mất dòng lặp cuối */
+        void Flush() {
+            std::lock_guard<std::mutex> lock(m_);
+            FlushRepeat();
+            if (f_) fflush(f_);
+        }
+
+    private:
+        struct ThrottleState { uint64_t last; uint64_t skipped; };
+
+        std::mutex  m_;
+        LogLevel    consoleLv_ = LogLevel::Info;    /* console: gọn */
+        LogLevel    fileLv_ = LogLevel::Debug;   /* file: đầy đủ */
+        FILE* f_ = nullptr;
+
+        std::string lastMsg_;
+        LogLevel    lastLv_ = LogLevel::Info;
+        uint64_t    repeat_ = 0;
+        std::map<std::string, ThrottleState> throttle_;
+
+        /* Gọi KHI ĐANG GIỮ m_ */
+        void FlushRepeat() {
+            if (repeat_ == 0) return;
+            char note[160];
+            snprintf(note, sizeof(note), "  ^ dong tren lap lai them %llu lan", repeat_);
+            uint64_t n = repeat_;
+            repeat_ = 0;
+            (void)n;
+            EmitRaw(lastLv_, note);
+        }
+
+        /* Gọi KHI ĐANG GIỮ m_ */
+        void Emit(LogLevel lv, const char* msg) { EmitRaw(lv, msg); }
+
+        void EmitRaw(LogLevel lv, const char* msg) {
             auto stamp = Stamp();
 
-            /* Console — có màu */
-            SetColor(lv);
-            printf("[%s] %s %s\n", stamp.c_str(), Tag(lv), buf);
-            SetColor(LogLevel::Info);
-            fflush(stdout);
-
-            /* File — không màu, không flush mỗi dòng */
-            if (f_) {
-                fprintf(f_, "[%s] %s %s\n", stamp.c_str(), Tag(lv), buf);
-                /* Chỉ flush khi ALERT/ERROR để đảm bảo log quan trọng không mất */
+            if (lv >= consoleLv_) {
+                SetColor(lv);
+                printf("[%s] %s %s\n", stamp.c_str(), Tag(lv), msg);
+                SetColor(LogLevel::Info);
+                fflush(stdout);
+            }
+            if (f_ && lv >= fileLv_) {
+                fprintf(f_, "[%s] %s %s\n", stamp.c_str(), Tag(lv), msg);
+                /* Chỉ flush khi WARN trở lên để đảm bảo log quan trọng không mất */
                 if (lv >= LogLevel::Warn) fflush(f_);
             }
         }
-        void SetMinLevel(LogLevel lv) { min_ = lv; }
-
-    private:
-        std::mutex m_;
-        LogLevel   min_ = LogLevel::Info;
-        FILE* f_ = nullptr;
 
         static const char* Tag(LogLevel lv) {
             switch (lv) {
@@ -155,6 +272,10 @@ namespace rw {
 #define LOG_W(...) rw::Logger::I().Log(rw::LogLevel::Warn , __VA_ARGS__)
 #define LOG_E(...) rw::Logger::I().Log(rw::LogLevel::Error, __VA_ARGS__)
 #define LOG_A(...) rw::Logger::I().Log(rw::LogLevel::Alert, __VA_ARGS__)
+
+    /* Throttle: tối đa 1 dòng mỗi <ms> cho mỗi <key>. Dùng cho chỗ biết trước là ồn. */
+#define LOG_TD(key, ms, ...) rw::Logger::I().LogThrottled(rw::LogLevel::Debug, key, ms, __VA_ARGS__)
+#define LOG_TI(key, ms, ...) rw::Logger::I().LogThrottled(rw::LogLevel::Info , key, ms, __VA_ARGS__)
 
     /* ======================================================================
        ENTROPY

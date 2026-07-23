@@ -1,23 +1,31 @@
 /*
- * main.cpp — RansomWall v4.0 User-Space Engine
+ * main.cpp — RansomWall v4.4 User-Space Engine
  *
- * KIẾN TRÚC (mục 2 của báo cáo):
+ * ===========================================================================
+ * BẢN VÁ v4.4
+ * ===========================================================================
+ *   [FIX 11] Xử lý RwActionRead — sự kiện MỞ ĐỌC file giá trị.
  *
- *   Event từ driver
- *        │
- *        ├──> CoW ENGINE ────> backup ────> CMD_CONTINUE ────> KẾT THÚC
- *        │    (không chờ điểm, không gọi ML, không phụ thuộc Flask)
- *        │
- *        └──> DYNAMIC ANALYSIS ──> 13 features ──> score >= 6 ──> ML
- *             (song song, không chặn I/O)
+ *            Chaos đọc file gốc rồi ghi ra file mới "<goc>.1bnp" và xoá gốc.
+ *            Đường GHI không bao giờ thấy gì. Event ĐỌC là tín hiệu duy nhất
+ *            đến ĐÚNG LÚC — và honey file là bẫy hoàn hảo cho nó: chạm là đủ,
+ *            không cần chờ bị ghi.
  *
- * HAI NHÁNH ĐỘC LẬP VỀ ĐIỀU KHIỂN, CỘNG HƯỞNG VỀ DỮ LIỆU:
- *   CoW lưu entropy_before/magic_before -> F12/F13 dùng lại MIỄN PHÍ.
+ *            Event này KHÔNG PEND -> chỉ tính điểm, không backup, không DENY.
  *
- * SỬA LỖI (F4 honey không bao giờ bắn):
- *   Nhánh IsPending return sớm sau CoW -> toàn bộ Dynamic Analysis (gồm F4)
- *   không tới lượt cho first-touch. Tách honey tripwire (CheckHoneyTouch)
- *   chạy TRƯỚC CoW trong nhánh IsPending.
+ *   [FIX 12] KHÔNG BACKUP HONEY FILE.
+ *
+ *            110 honey file (.txt/.xlsx/.pdf) đều nằm trong VALUABLE_EXTS nên
+ *            v4.3 backup hết -> ngốn quota của tiến trình thật.
+ *            Honey là BẪY, không phải dữ liệu. Mất cũng không sao.
+ *
+ * ===========================================================================
+ * BẢN VÁ CŨ (giữ nguyên)
+ * ===========================================================================
+ *   [FIX 10] Truyền disposition xuống CoW + PROBE chẩn đoán err=2.
+ *   [TẠM]    RW_BYPASS_ML — score >= SCORE_ML_TRIGGER là kill ngay.
+ *   [CHẶN]   Không kill explorer/svchost/services...
+ * ===========================================================================
  */
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -49,29 +57,33 @@
 using namespace rw;
 
 /* ==========================================================================
-   TRẠNG THÁI TOÀN CỤC
+   [TẠM THỜI] BỎ QUA ML
    ========================================================================== */
+#define RW_BYPASS_ML 1
+
+   /* ==========================================================================
+      TRẠNG THÁI TOÀN CỤC
+      ========================================================================== */
 static std::mutex                      g_Mtx;
 static std::map<DWORD, ProcessFeature> g_Collector;
 static std::atomic<bool>               g_Running{ true };
 static std::atomic<bool>               g_DriverMode{ false };
+static std::atomic<uint64_t> g_EvTotal{ 0 };
+static std::atomic<uint64_t> g_EvPend{ 0 };
+static std::atomic<uint64_t> g_EvRead{ 0 };     /* [FIX 11] đếm event mở đọc */
 
-/* Cache kết quả tĩnh theo IMAGE HASH — sửa lỗi slot 9999 đơn của v3.0.
-   v3.0: hai .exe rơi vào Downloads gần nhau -> file sau ghi đè processName,
-   file trước MẤT ĐIỂM TĨNH VĨNH VIỄN. */
+static std::atomic<uint64_t> g_CowFail{ 0 };
+static std::atomic<uint64_t> g_CowDeny{ 0 };
+
 static std::mutex                          g_StaticMtx;
-static std::map<std::string, StaticResult> g_StaticCache;   // key = SHA-256 image
-static std::set<std::string>               g_StaticInFlight; // chống thundering herd
+static std::map<std::string, StaticResult> g_StaticCache;
+static std::set<std::string>               g_StaticInFlight;
 
-/*
- * IsOwnTool — file này có phải công cụ của CHÍNH RansomWall không?
- * Phân tích diec.exe bằng diec.exe = đệ quy vô hạn.
- */
 static bool IsOwnTool(const std::wstring& imagePath) {
     static const std::wstring toolDir = ToLower(GetModuleDir());
     if (toolDir.empty()) return false;
     std::wstring low = ToLower(imagePath);
-    if (low.rfind(toolDir, 0) != 0) return false;   // không nằm trong thư mục của ta
+    if (low.rfind(toolDir, 0) != 0) return false;
 
     std::wstring name = GetFileNameOnly(low);
     return name == L"diec.exe" || name == L"die.exe" ||
@@ -99,30 +111,100 @@ static ProcessFeature& EnsurePf(DWORD pid, DWORD rootPid) {   /* gọi DƯỚI l
     return pf;
 }
 
+static int ScoreOf(DWORD pid) {
+    std::lock_guard<std::mutex> lk(g_Mtx);
+    auto it = g_Collector.find(pid);
+    return (it != g_Collector.end()) ? it->second.totalScore : 0;
+}
+
+static bool IsCriticalSystemProcess(const ProcessFeature& pf) {
+    std::wstring n = ToLower(GetFileNameOnly(pf.processImage));
+    static const std::set<std::wstring> names = {
+        L"explorer.exe", L"svchost.exe", L"services.exe", L"lsass.exe",
+        L"winlogon.exe", L"csrss.exe", L"wininit.exe", L"smss.exe",
+        L"dwm.exe", L"taskhostw.exe",
+    };
+    if (!names.count(n)) return false;
+
+    std::wstring low = ToLower(pf.processImage);
+    bool inSystemDir = false;
+    for (auto& d : cfg::SYSTEM_DIRS)
+        if (low.rfind(d, 0) == 0) { inSystemDir = true; break; }
+
+    return inSystemDir && !pf.f1_unsigned.value;  // đúng path VÀ có chữ ký hợp lệ
+}
+
+/* ==========================================================================
+   [FIX 15] SeDebugPrivilege — BỎ QUA KIỂM TRA DACL KHI MỞ TIẾN TRÌNH
+   ==========================================================================
+   Đo được trong log thực tế (mẫu 000_PP0_100-43.exe):
+
+       Kill PID=3356 ... Kill PID=1160        <- 10 tien trinh con chet
+       Khong mo duoc PID=7940 de kill (err=5) <- CHINH RANSOMWARE KHONG CHET
+
+   err=5 = ACCESS_DENIED. OpenProcess(PROCESS_TERMINATE) bị chặn vì ransomware
+   TỰ ĐẶT DACL từ chối PROCESS_TERMINATE — kỹ thuật tự bảo vệ phổ biến.
+   Chạy Administrator KHÔNG tự động vượt qua DACL.
+
+   SeDebugPrivilege thì có: bật lên, OpenProcess bỏ qua kiểm tra DACL hoàn
+   toàn. Đây là cách Task Manager / Process Explorer / debugger mở mọi tiến trình.
+
+   Đặc quyền này CÓ trong token Administrator nhưng mặc định ở trạng thái
+   DISABLED — Windows không tự bật vì nó rất mạnh (bật rồi mở được cả lsass).
+   Ứng dụng phải chủ động yêu cầu.
+
+   GIỚI HẠN: không vượt được Protected Process Light (PPL). Ransomware hiếm
+   khi đạt PPL vì cần chữ ký Microsoft, nên trong thực tế không phải vấn đề.
+   ========================================================================== */
+static bool EnableDebugPrivilege() {
+    HANDLE hTok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(),
+        TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hTok))
+        return false;
+
+    TOKEN_PRIVILEGES tp{};
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    if (!LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &tp.Privileges[0].Luid)) {
+        CloseHandle(hTok);
+        return false;
+    }
+
+    AdjustTokenPrivileges(hTok, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+    /* AdjustTokenPrivileges trả TRUE cả khi KHÔNG bật được đặc quyền nào.
+       Phải kiểm GetLastError. */
+    bool ok = (GetLastError() == ERROR_SUCCESS);
+    CloseHandle(hTok);
+    return ok;
+}
+
 /*
- * CheckHoneyTouch — Honey tripwire, PHẢI chạy được cả khi IRP đang pend.
+ * CheckHoneyTouch — Honey tripwire.
  *
- * Nhánh IsPending trong OnEvent return sớm sau CoW nên khối F4 trong Dynamic
- * Analysis KHÔNG BAO GIỜ tới lượt cho first-touch. Tách ra đây để honey luôn
- * được kiểm, độc lập với nhánh dynamic.
+ * [FIX 11] Giờ được gọi từ CẢ HAI đường: mở ghi (pend) VÀ mở đọc (không pend).
+ * Đọc honey file là đủ để kết luận — nó là bẫy, không ai có lý do chính đáng
+ * để mở nó ra xem.
  *
- * Trả về true nếu honey vừa bị chạm bởi tiến trình KHÔNG whitelist.
  * Gọi KHÔNG dưới g_Mtx (tự lock bên trong).
  */
-static bool CheckHoneyTouch(DWORD pid, DWORD root, const std::wstring& path) {
+static bool CheckHoneyTouch(DWORD pid, DWORD root, const std::wstring& path,
+    const char* how) {
     if (!g_Honey.IsHoney(path)) return false;
     if (HoneyFiles::IsWhitelisted(pid)) {
-        LOG_D("      Honey bi cham boi tien trinh whitelist -> bo qua");
+        /* [FIX 19] Throttle: Search Indexer quet 110 honey file moi tao ->
+           109 dong giong het nhau lien tiep. Chi can biet no CO xay ra. */
+        LOG_TD("honey_wl", 10000,
+            "      Honey bi cham boi tien trinh whitelist (PID=%lu) -> bo qua", pid);
         return false;
     }
     std::lock_guard<std::mutex> lk(g_Mtx);
     auto& pf = EnsurePf(root, root);
-    pf.Raise(pf.f4_honeyModified, "F4 honey file bi sua doi");
-    LOG_I("      honey: %s", ws2s(GetFileNameOnly(path)).c_str());
+    pf.Raise(pf.f4_honeyModified, "F4 honey file bi cham");
+    LOG_A("      *** HONEY (%s): %s *** PID=%lu root=%lu",
+        how, ws2s(GetFileNameOnly(path)).c_str(), pid, root);
     return true;
 }
 
-/* Áp kết quả tĩnh vào một PID — gọi DƯỚI lock */
 static void ApplyStatic(ProcessFeature& pf, const StaticResult& r) {
     if (r.unsignedImage) pf.Raise(pf.f1_unsigned, "F1 chu ky so khong hop le");
     if (r.packed)        pf.Raise(pf.f2_packed, "F2 packer/cryptor");
@@ -132,14 +214,12 @@ static void ApplyStatic(ProcessFeature& pf, const StaticResult& r) {
     pf.imageSha256 = r.imageSha256;
 }
 
-/* Tính điểm tĩnh 0-5 từ StaticResult */
 static int StaticScore(const StaticResult& r) {
     return (r.unsignedImage ? 1 : 0) + (r.packed ? 1 : 0) +
         (r.suspStrings ? 1 : 0) + (r.cryptoApi ? 1 : 0) +
         (r.safeModeStr ? 1 : 0);
 }
 
-/* Thư mục cần quét tĩnh — dùng chung cho quét ban đầu và watcher */
 static std::vector<std::wstring> StaticScanDirs() {
     std::vector<std::wstring> dirs;
     std::wstring lad = GetKnownFolder(FOLDERID_LocalAppData);
@@ -152,15 +232,9 @@ static std::vector<std::wstring> StaticScanDirs() {
 }
 
 /*
- * ShouldAnalyzeStatically — LỌC TRƯỚC KHI QUÉT
- *
- * LỖI ĐÃ SỬA (máy lag): quét tĩnh MỌI tiến trình Windows khởi động.
- *   svchost.exe, RuntimeBroker.exe, taskhostw.exe, backgroundTaskHost.exe,
- *   SoftLandingTask.exe... Windows đẻ hàng chục cái mỗi phút.
- *   Mỗi cái = SHA-256 toàn file + parse PE + DIE + FLOSS.
- *
- * File trong C:\Windows / Program Files mà CÓ chữ ký hợp lệ -> bỏ qua hẳn.
- * KHÔNG có chữ ký dù nằm trong đó -> vẫn quét (dấu hiệu bị thay thế).
+ * CẢNH BÁO: VerifySignature đang trả FALSE cho cmd.exe, conhost.exe,
+ * vssadmin.exe... — không đọc được catalog signature. Hệ quả: bộ lọc này
+ * gần như vô hiệu và F1 bật cho 100% tiến trình. Cần sửa trong Util.h.
  */
 static bool ShouldAnalyzeStatically(const std::wstring& img) {
     std::wstring low = ToLower(img);
@@ -168,15 +242,11 @@ static bool ShouldAnalyzeStatically(const std::wstring& img) {
     for (const auto& d : cfg::SYSTEM_DIRS)
         if (low.rfind(d, 0) == 0) { inSystemDir = true; break; }
 
-    if (!inSystemDir) return true;          /* ngoài vùng hệ thống -> luôn quét */
-    if (VerifySignature(img)) return false; /* trong vùng hệ thống + đã ký -> bỏ qua */
-    return true;                            /* trong vùng hệ thống mà KHÔNG ký -> đáng ngờ */
+    if (!inSystemDir) return true;
+    if (VerifySignature(img)) return false;
+    return true;
 }
 
-/*
- * AnalyzeImageCached — quét một image, cache theo SHA-256.
- * Dùng chung cho cả watcher (trước khi chạy) và process-create (khi chạy).
- */
 static bool AnalyzeImageCached(const std::wstring& img, StaticResult& out) {
     std::string hash = Sha256File(img);
     if (hash.empty()) return false;
@@ -185,7 +255,7 @@ static bool AnalyzeImageCached(const std::wstring& img, StaticResult& out) {
         std::lock_guard<std::mutex> lk(g_StaticMtx);
         auto it = g_StaticCache.find(hash);
         if (it != g_StaticCache.end()) { out = it->second; return true; }
-        if (g_StaticInFlight.count(hash)) return false;   /* luồng khác đang quét */
+        if (g_StaticInFlight.count(hash)) return false;
         g_StaticInFlight.insert(hash);
     }
 
@@ -199,33 +269,20 @@ static bool AnalyzeImageCached(const std::wstring& img, StaticResult& out) {
 
 /* ==========================================================================
    GIAI ĐOẠN 2 — TIẾN TRÌNH KHỞI ĐỘNG
-   ==========================================================================
-   Cache HIT  -> áp điểm tĩnh NGAY (0ms). Đây là đường đi mong muốn:
-                 giai đoạn 1 đã quét file này rồi.
-   Cache MISS -> file đến từ vùng không được watcher phủ (mạng, USB, ổ khác).
-                 Quét ngay bây giờ = MUỘN: ransomware đã chạy rồi.
-                 Đây là lưới vét, không phải đường chính.
    ========================================================================== */
 static void RunStaticForPid(DWORD pid) {
     std::wstring img = GetProcessImagePath(pid);
     if (img.empty()) return;
 
-    /*
-     * ---- CHẶN ĐỆ QUY ----
-     * RansomWall spawn diec.exe -> process create -> phan tich diec.exe
-     * -> spawn diec.exe QUET diec.exe -> ... vô hạn
-     */
     if (IsOwnTool(img)) return;
     if (IsDescendantOfSelf(pid)) return;
 
-    /* ---- LỌC HIỆU NĂNG ---- */
     if (!ShouldAnalyzeStatically(img)) {
-        LOG_D("[STATIC] Bo qua (he thong + da ky): %s",
+        LOG_TD("static_skip", 30000, "[STATIC] Bo qua (he thong + da ky): %s",
             ws2s(GetFileNameOnly(img)).c_str());
         return;
     }
 
-    /* Cache hit? -> giai đoạn 1 đã quét, áp ngay */
     std::string hash = Sha256File(img);
     bool hit = false;
     StaticResult r;
@@ -247,8 +304,6 @@ static void RunStaticForPid(DWORD pid) {
 
     std::lock_guard<std::mutex> lk(g_Mtx);
 
-    /* Dùng EnsurePf tránh race condition: static thread thắng trước
-       event đầu tiên từ kernel -> find() miss -> điểm tĩnh mất */
     DWORD rootForStatic = 0;
     {
         auto eit = g_Collector.find(pid);
@@ -257,7 +312,6 @@ static void RunStaticForPid(DWORD pid) {
     auto& pf = EnsurePf(pid, rootForStatic);
     ApplyStatic(pf, r);
 
-    /* Merge về RootPid nếu đây là tiến trình con */
     DWORD rootPid = (pf.rootPid != 0 && pf.rootPid != pid) ? pf.rootPid : 0;
     if (rootPid == 0) {
         std::vector<DWORD> watched;
@@ -281,7 +335,151 @@ static void RunStaticForPid(DWORD pid) {
 }
 
 /* ==========================================================================
-   ML — chạy trên thread riêng, KHÔNG BAO GIỜ chặn CoW
+   XỬ LÝ PHÁN QUYẾT MALWARE
+   ========================================================================== */
+static void HandleMalwareVerdict(DWORD pid, double conf) {
+    LOG_A("[KILL] === MALWARE (conf=%.2f) PID=%lu ===", conf, pid);
+
+    {
+        std::vector<DWORD> tree;
+        tree.push_back(pid);
+        DWORD selfPid = GetCurrentProcessId();
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap != INVALID_HANDLE_VALUE) {
+            std::map<DWORD, std::vector<DWORD>> children;
+            PROCESSENTRY32W pe{}; pe.dwSize = sizeof(pe);
+            if (Process32FirstW(snap, &pe)) {
+                do {
+                    if (pe.th32ProcessID > 4 && pe.th32ParentProcessID > 4)
+                        children[pe.th32ParentProcessID].push_back(pe.th32ProcessID);
+                } while (Process32NextW(snap, &pe));
+            }
+            CloseHandle(snap);
+            for (size_t i = 0; i < tree.size() && tree.size() < 64; i++) {
+                auto cit = children.find(tree[i]);
+                if (cit != children.end())
+                    for (DWORD child : cit->second)
+                        if (child != pid && child != selfPid)
+                            tree.push_back(child);
+            }
+        }
+
+        {
+            std::set<std::string> badHashes;
+            {
+                std::lock_guard<std::mutex> lk(g_Mtx);
+                for (auto& [p, f] : g_Collector) {
+                    if ((p == pid || f.rootPid == pid) && !f.imageSha256.empty())
+                        badHashes.insert(f.imageSha256);
+                }
+            }
+            if (!badHashes.empty()) {
+                std::lock_guard<std::mutex> lk(g_Mtx);
+                for (auto& [p, f] : g_Collector) {
+                    if (p == selfPid || !badHashes.count(f.imageSha256)) continue;
+                    if (std::find(tree.begin(), tree.end(), p) != tree.end()) continue;
+                    tree.push_back(p);
+                    LOG_A("   [!] Cung hash voi mau: PID=%lu %s",
+                        p, ws2s(GetFileNameOnly(f.processImage)).c_str());
+                }
+            }
+        }
+
+        {
+            std::vector<DWORD> safe;
+            for (DWORD p : tree) {
+                std::wstring img;
+                {
+                    std::lock_guard<std::mutex> lk(g_Mtx);
+                    auto it = g_Collector.find(p);
+                    if (it != g_Collector.end()) img = it->second.processImage;
+                }
+                if (img.empty()) img = GetProcessImagePath(p);
+
+                rw::ProcessFeature pf{};
+                pf.processImage = img;
+                if (IsCriticalSystemProcess(pf)) {
+                    LOG_W("   [BO QUA] KHONG kill %s (PID=%lu) — tien trinh he thong.",
+                        ws2s(GetFileNameOnly(img)).c_str(), p);
+                    continue;
+                }
+                safe.push_back(p);
+            }
+            tree.swap(safe);
+        }
+
+        if (tree.empty()) {
+            LOG_W("   [!] Sau khi loc, khong con PID nao de kill. Dung lai.");
+            return;
+        }
+
+        LOG_I("   [1/4] Deny IRP + kill %zu tien trinh trong cay PID=%lu",
+            tree.size(), pid);
+        if (g_Filter && g_Filter->IsConnected())
+            for (DWORD p : tree) g_Filter->DenyPid(p);
+        for (auto it = tree.rbegin(); it != tree.rend(); ++it) {
+            HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, *it);
+            if (h) {
+                TerminateProcess(h, 1); CloseHandle(h);
+                LOG_I("      Kill PID=%lu", *it);
+            }
+            else {
+                DWORD e = GetLastError();
+                if (e == ERROR_INVALID_PARAMETER)
+                    LOG_D("      PID=%lu da thoat tu truoc", *it);
+                else
+                    LOG_W("      Khong mo duoc PID=%lu de kill (err=%lu)", *it, e);
+            }
+        }
+    }
+    Sleep(500);
+
+    {
+        bool explorerRunning = false;
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W pe{}; pe.dwSize = sizeof(pe);
+            if (Process32FirstW(snap, &pe))
+                do {
+                    if (_wcsicmp(pe.szExeFile, L"explorer.exe") == 0) {
+                        explorerRunning = true; break;
+                    }
+                } while (Process32NextW(snap, &pe));
+            CloseHandle(snap);
+        }
+        if (!explorerRunning) {
+            LOG_I("   [2b] Khoi dong lai explorer.exe");
+            STARTUPINFOW si{}; si.cb = sizeof(si);
+            PROCESS_INFORMATION pi{};
+            wchar_t cmd[] = L"explorer.exe";
+            if (CreateProcessW(nullptr, cmd, nullptr, nullptr, FALSE,
+                0, nullptr, nullptr, &si, &pi)) {
+                CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+                Sleep(1500);
+            }
+        }
+    }
+
+    LOG_I("   [3/4] So hash + restore co dieu kien...");
+    auto st = g_Clean->RestoreFiles(pid);
+    int cleaned = g_Clean->CleanRansomArtifacts(pid);
+    g_Clean->OnMalware(pid);
+
+    LOG_A("   [3/4] KET QUA RESTORE: khoi phuc=%d  can xem lai=%d  xoa rac=%d",
+        st.overwritten + st.missing, st.sidelined, cleaned);
+
+    std::wstring msg = L"RansomWall phat hien RANSOMWARE!\n\n"
+        L"PID: " + std::to_wstring(pid) + L"\n"
+        L"Da khoi phuc: " + std::to_wstring(st.overwritten + st.missing) + L" file\n"
+        L"Can ban xem lai: " + std::to_wstring(st.sidelined) + L" file\n"
+        L"Da xoa " + std::to_wstring(cleaned) + L" file rac ma hoa\n\n"
+        L"Bang chung da luu tai " + cfg::QUARANTINE_ROOT;
+    LOG_I("   [4/4] Bao nguoi dung");
+    MessageBoxW(nullptr, msg.c_str(), L"RansomWall — MALWARE", MB_OK | MB_ICONSTOP);
+}
+
+/* ==========================================================================
+   ML
    ========================================================================== */
 static void CallML(DWORD pid) {
     std::string body;
@@ -299,7 +497,6 @@ static void CallML(DWORD pid) {
 
     MLResponse resp = g_ML.Predict(body);
 
-    /* Nhả quyền + kiểm tra đã xử lý phán quyết chưa — TẤT CẢ dưới một lock */
     bool handleMalware = false, handleBenign = false;
     {
         std::lock_guard<std::mutex> lk(g_Mtx);
@@ -319,110 +516,12 @@ static void CallML(DWORD pid) {
     }
 
     if (handleMalware) {
-        LOG_A("[ML] === MALWARE (conf=%.2f) PID=%lu ===", resp.confidence, pid);
-
-        /* THỨ TỰ QUAN TRỌNG (v3.0 làm ngược):
-           1. deny IRP TRƯỚC — taskkill không tức thời, I/O đang bay vẫn hoàn tất
-           2. kill
-           3. so hash + restore có điều kiện
-           4. báo user */
-           /* ── Bước 1+2: thu thập cây, deny IRP tất cả, kill từ lá lên gốc ── */
-        {
-            std::vector<DWORD> tree;
-            tree.push_back(pid);
-            DWORD selfPid = GetCurrentProcessId();
-            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-            if (snap != INVALID_HANDLE_VALUE) {
-                std::map<DWORD, std::vector<DWORD>> children;
-                PROCESSENTRY32W pe{}; pe.dwSize = sizeof(pe);
-                if (Process32FirstW(snap, &pe)) {
-                    do {
-                        if (pe.th32ProcessID > 4 && pe.th32ParentProcessID > 4)
-                            children[pe.th32ParentProcessID].push_back(pe.th32ProcessID);
-                    } while (Process32NextW(snap, &pe));
-                }
-                CloseHandle(snap);
-                for (size_t i = 0; i < tree.size() && tree.size() < 64; i++) {
-                    auto cit = children.find(tree[i]);
-                    if (cit != children.end())
-                        for (DWORD child : cit->second)
-                            if (child != pid && child != selfPid)
-                                tree.push_back(child);
-                }
-            }
-            LOG_I("   [1/4] Deny IRP + kill %zu tien trinh trong cay PID=%lu",
-                tree.size(), pid);
-            if (g_Filter && g_Filter->IsConnected())
-                for (DWORD p : tree) g_Filter->DenyPid(p);
-            for (auto it = tree.rbegin(); it != tree.rend(); ++it) {
-                HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, *it);
-                if (h) {
-                    TerminateProcess(h, 1); CloseHandle(h);
-                    LOG_I("      Kill PID=%lu", *it);
-                }
-            }
-        }
-        Sleep(500);
-
-        /* Khởi lại explorer nếu bị ransomware kill trước đó */
-        {
-            bool explorerRunning = false;
-            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-            if (snap != INVALID_HANDLE_VALUE) {
-                PROCESSENTRY32W pe{}; pe.dwSize = sizeof(pe);
-                if (Process32FirstW(snap, &pe))
-                    do {
-                        if (_wcsicmp(pe.szExeFile, L"explorer.exe") == 0)
-                        {
-                            explorerRunning = true; break;
-                        }
-                    } while (Process32NextW(snap, &pe));
-                CloseHandle(snap);
-            }
-            if (!explorerRunning) {
-                LOG_I("   [2b] Khoi dong lai explorer.exe");
-                STARTUPINFOW si{}; si.cb = sizeof(si);
-                PROCESS_INFORMATION pi{};
-                wchar_t cmd[] = L"explorer.exe";
-                if (CreateProcessW(nullptr, cmd, nullptr, nullptr, FALSE,
-                    0, nullptr, nullptr, &si, &pi)) {
-                    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-                    Sleep(1500);
-                }
-            }
-        }
-        LOG_I("   [3/4] So hash + restore co dieu kien...");
-        auto st = g_Clean->RestoreFiles(pid);
-        int cleaned = g_Clean->CleanRansomArtifacts(pid);
-        g_Clean->OnMalware(pid);
-
-        std::wstring msg = L"RansomWall phat hien RANSOMWARE!\n\n"
-            L"PID: " + std::to_wstring(pid) + L"\n"
-            L"Da khoi phuc: " + std::to_wstring(st.overwritten + st.missing) + L" file\n"
-            L"Can ban xem lai: " + std::to_wstring(st.sidelined) + L" file\n"
-            L"Da xoa " + std::to_wstring(cleaned) + L" file rac ma hoa\n\n"
-            L"Bang chung da luu tai " + cfg::QUARANTINE_ROOT;
-        LOG_I("   [4/4] Bao nguoi dung");
-        MessageBoxW(nullptr, msg.c_str(), L"RansomWall — MALWARE", MB_OK | MB_ICONSTOP);
+        HandleMalwareVerdict(pid, resp.confidence);
         return;
     }
 
     if (handleBenign) {
-        /*
-         * BENIGN — nhưng KHÔNG xóa backup ngay nếu score vẫn cao.
-         *
-         * Vấn đề: ML lần 1 trả BENIGN → OnBenign() xóa backup → ML lần 2
-         * trả MALWARE → không còn gì để restore.
-         *
-         * Giải pháp: chỉ xóa backup khi score < SCORE_FREEZE (< 2).
-         * Score cao = vẫn đang theo dõi chặt → giữ backup phòng hờ.
-         */
-        int curScore = 0;
-        {
-            std::lock_guard<std::mutex> lk(g_Mtx);
-            auto it = g_Collector.find(pid);
-            if (it != g_Collector.end()) curScore = it->second.totalScore;
-        }
+        int curScore = ScoreOf(pid);
 
         if (curScore < cfg::SCORE_FREEZE) {
             LOG_I("[ML] BENIGN (conf=%.2f) PID=%lu score=%d -> unblock, xoa backup",
@@ -431,12 +530,10 @@ static void CallML(DWORD pid) {
             g_Clean->OnBenign(pid);
         }
         else {
-            LOG_I("[ML] BENIGN (conf=%.2f) PID=%lu score=%d — GIU BACKUP (score van cao, tiep tuc theo doi)",
+            LOG_I("[ML] BENIGN (conf=%.2f) PID=%lu score=%d — GIU BACKUP (score van cao)",
                 resp.confidence, pid, curScore);
             if (g_Filter && g_Filter->IsConnected()) g_Filter->UndenyPid(pid);
-            /* KHÔNG gọi OnBenign() — backup được giữ nguyên phòng ML gọi lại */
         }
-        /* KHÔNG khoá aiCalled. BENIGN chỉ là phán quyết TẠI THỜI ĐIỂM ĐÓ. */
         return;
     }
 
@@ -444,10 +541,6 @@ static void CallML(DWORD pid) {
         LOG_W("[ML] Ket qua khong ro cho PID=%lu: %s", pid, resp.raw.c_str());
 }
 
-/*
- * MaybeCallML — GIÀNH QUYỀN NGAY dưới lock, không phải trong thread con.
- * Đây là chỗ sửa bug stampede: cập nhật state TRƯỚC khi spawn.
- */
 static void MaybeCallML(DWORD pid) {
     bool go = false;
     {
@@ -456,11 +549,10 @@ static void MaybeCallML(DWORD pid) {
         if (it == g_Collector.end()) return;
         auto& pf = it->second;
 
-        if (pf.ml.inFlight)       return;   /* đang có luồng gọi ML */
-        if (pf.ml.verdictHandled) return;   /* đã kết luận MALWARE, xong */
+        if (pf.ml.inFlight)       return;
+        if (pf.ml.verdictHandled) return;
         if (!pf.ShouldCallML())   return;
 
-        /* Giành quyền + cập nhật state NGAY TẠI ĐÂY, dưới cùng lock */
         pf.ml.inFlight = true;
         pf.ml.callCount++;
         pf.ml.lastCall = Clock::now();
@@ -472,11 +564,48 @@ static void MaybeCallML(DWORD pid) {
     if (go) std::thread([pid] { CallML(pid); }).detach();
 }
 
+static void MaybeTriggerNoML(DWORD pid) {
+    bool go = false;
+    int  score = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_Mtx);
+        auto it = g_Collector.find(pid);
+        if (it == g_Collector.end()) return;
+        auto& pf = it->second;
+
+        if (pf.ml.verdictHandled) return;
+        if (pf.totalScore < cfg::SCORE_ML_TRIGGER) return;
+
+        if (IsCriticalSystemProcess(pf)) {
+            LOG_W("[NO-ML] PID=%lu score=%d nhung la %s — BO QUA.",
+                pid, pf.totalScore, ws2s(GetFileNameOnly(pf.processImage)).c_str());
+            pf.ml.verdictHandled = true;
+            return;
+        }
+
+        pf.ml.verdictHandled = true;
+        score = pf.totalScore;
+        go = true;
+    }
+    if (go) {
+        LOG_A("[NO-ML] PID=%lu dat score=%d >= %d -> XU LY NHU MALWARE (bo qua ML)",
+            pid, score, cfg::SCORE_ML_TRIGGER);
+        std::thread([pid] { HandleMalwareVerdict(pid, 1.0); }).detach();
+    }
+}
+
+static inline void TriggerVerdict(DWORD pid) {
+#if RW_BYPASS_ML
+    MaybeTriggerNoML(pid);
+#else
+    MaybeCallML(pid);
+#endif
+}
+
 /* ==========================================================================
    DYNAMIC ANALYSIS ENGINE
    ========================================================================== */
 
-   /* --- F11: phát hiện đuôi ransomware --- */
 static bool IsKnownRansomExt(const std::wstring& ext) {
     static const std::set<std::wstring> k = {
         L".locked", L".enc", L".encrypted", L".crypt", L".crypto", L".wncry",
@@ -486,21 +615,13 @@ static bool IsKnownRansomExt(const std::wstring& ext) {
     return k.count(ext) > 0;
 }
 
-/*
- * SỬA LỖI v3.0: heuristic "đuôi hex 3-8 ký tự" bắt nhầm .log, .cab, .dec, .bed,
- * .fee, .add, .ace... (đều là hex hợp lệ). Dương tính giả nặng.
- *
- * v4.0: cùng MỘT đuôi lạ xuất hiện trên >= 20 file khác nhau trong 30s.
- * Ransomware dùng chung một đuôi; hoạt động bình thường thì không.
- */
 static bool IsMassNewExtension(ProcessFeature& pf, const std::wstring& ext) {
     if (ext.empty() || ext.size() > 12) return false;
     if (cfg::VALUABLE_EXTS.count(ext) || cfg::EXECUTABLE_EXTS.count(ext)) return false;
     int n = ++pf.newExtHistogram[ext];
-    return n >= 5;   /* hạ từ 20 -> 5: bắt Dharma/Phobos encrypt ít file */
+    return n >= 5;
 }
 
-/* --- F12: so magic_before (từ manifest) vs magic_now --- */
 static bool CheckFingerprint(ProcessFeature& pf, const std::wstring& path) {
     const BackupEntry* e = g_Cow->FindEntry(pf, path);
     if (!e || e->magicBefore.empty()) return false;
@@ -514,44 +635,12 @@ static bool CheckFingerprint(ProcessFeature& pf, const std::wstring& path) {
     return true;
 }
 
-/*
- * --- F13: DELTA entropy ---
- *
- * SỬA LỖI v3.0: ngưỡng tuyệt đối 7.5.
- *   .docx/.xlsx/.zip/.jpg GỐC đã có H ≈ 7.9  ->  bật cờ cho MỌI thao tác
- *   với file nén, kể cả 7-Zip hợp lệ.
- *
- * v4.0: ΔH = H_sau − H_trước, với H_trước lấy MIỄN PHÍ từ manifest của CoW.
- *   report.docx : 7.91 -> 7.99  ΔH=+0.08  -> khong bat (nhung F12 bat magic)
- *   notes.txt   : 4.21 -> 7.98  ΔH=+3.77  -> BAT
- *   backup.zip  : 7.94 -> 7.93  ΔH=-0.01  -> 7-Zip lanh tinh, khong bat
- */
-static bool CheckEntropyDelta(ProcessFeature& pf, const std::wstring& path) {
-    const BackupEntry* e = g_Cow->FindEntry(pf, path);
-    if (!e) return false;
-
-    double hNow = FileEntropy(path, cfg::ENTROPY_SAMPLE_BYTES);
-    if (hNow <= 0) return false;
-
-    double d = hNow - e->entropyBefore;
-    pf.entropyDelta.Add(d);
-
-    bool hit = (d > cfg::ENTROPY_DELTA_THRESHOLD) && (hNow > cfg::ENTROPY_ABS_THRESHOLD);
-    if (hit)
-        LOG_D("      F13: H %.2f -> %.2f  (dH=+%.2f)  %s",
-            e->entropyBefore, hNow, d, ws2s(GetFileNameOnly(path)).c_str());
-    return hit;
-}
-
-/* --- F6/F7: từ command line của tiến trình con, quy điểm về RootPid --- */
 static void HandleProcessCreate(const RW_EVENT& ev) {
     std::wstring cmd = ToLower(std::wstring(ev.CommandLine));
     if (cmd.empty()) return;
 
     DWORD root = ev.RootPid ? ev.RootPid : ev.Pid;
 
-    /* Nếu kernel không biết RootPid (RansomWall khởi động sau ransomware)
-       -> tra cây Windows thật */
     if (root == ev.Pid) {
         std::vector<DWORD> watched;
         {
@@ -563,7 +652,8 @@ static void HandleProcessCreate(const RW_EVENT& ev) {
         if (found == 0) found = GetRootPidFromTree(ev.Pid, {});
         if (found != 0) {
             root = found;
-            LOG_D("[PROC] PID=%lu RootPid=0 -> tra cay -> RootPid=%lu", ev.Pid, root);
+            LOG_TD("proc_tree", 15000,
+                "[PROC] PID=%lu RootPid=0 -> tra cay -> RootPid=%lu", ev.Pid, root);
         }
     }
 
@@ -573,7 +663,6 @@ static void HandleProcessCreate(const RW_EVENT& ev) {
         (cmd.find(L"wbadmin") != std::wstring::npos && cmd.find(L"delete") != std::wstring::npos) ||
         (cmd.find(L"win32_shadowcopy") != std::wstring::npos) ||
         (cmd.find(L"delete shadows") != std::wstring::npos) ||
-        /* Conti / BlackBasta / Akira dùng net stop và sc config */
         (cmd.find(L"net stop") != std::wstring::npos && (
             cmd.find(L"vss") != std::wstring::npos ||
             cmd.find(L"backup") != std::wstring::npos ||
@@ -582,7 +671,22 @@ static void HandleProcessCreate(const RW_EVENT& ev) {
         (cmd.find(L"sc config") != std::wstring::npos &&
             cmd.find(L"disabled") != std::wstring::npos) ||
         (cmd.find(L"powershell") != std::wstring::npos &&
-            cmd.find(L"win32_shadowcopy") != std::wstring::npos);
+            cmd.find(L"win32_shadowcopy") != std::wstring::npos) ||
+        /*
+         * [FIX 16] powercfg -h off — tắt hibernate, XOÁ hiberfil.sys.
+         * Akira và nhiều họ khác dùng để phá đường khôi phục và giải phóng
+         * chỗ trống. Log mẫu 000_PP0_100-43.exe spawn hàng chục powercfg.exe
+         * mà F7 im lặng hoàn toàn vì thiếu mẫu này.
+         */
+        (cmd.find(L"powercfg") != std::wstring::npos && (
+            cmd.find(L"-h ") != std::wstring::npos ||
+            cmd.find(L"/h ") != std::wstring::npos ||
+            cmd.find(L"hibernate") != std::wstring::npos)) ||
+        /* Xoá lịch sử khôi phục hệ thống / catalog backup */
+        (cmd.find(L"wmic") != std::wstring::npos &&
+            cmd.find(L"systemrestore") != std::wstring::npos) ||
+        (cmd.find(L"bcdedit") != std::wstring::npos &&
+            cmd.find(L"ignoreallfailures") != std::wstring::npos);
 
     bool safeMode =
         (cmd.find(L"bcdedit") != std::wstring::npos) ||
@@ -593,29 +697,29 @@ static void HandleProcessCreate(const RW_EVENT& ev) {
 
     if (!shadow && !safeMode) return;
 
-    /*
-     * QUY ĐIỂM VỀ ROOTPID — sửa lỗi lớn của v3.0.
-     * Ransomware gọi CreateProcess("vssadmin delete shadows").
-     * v3.0 cộng điểm cho PID của vssadmin.exe — một tiến trình sống 200ms
-     * rồi chết. Ransomware KHÔNG BAO GIỜ nhận được điểm này.
-     */
-    std::lock_guard<std::mutex> lk(g_Mtx);
-    auto& pf = EnsurePf(root, root);
-    if (shadow) {
-        pf.Raise(pf.f7_shadowDeleted, "F7 xoa Shadow Copy (tu cmdline con)");
-        LOG_I("      cmdline: %s", ws2s(cmd.substr(0, 120)).c_str());
+    {
+        std::lock_guard<std::mutex> lk(g_Mtx);
+        auto& pf = EnsurePf(root, root);
+        if (shadow) {
+            pf.Raise(pf.f7_shadowDeleted, "F7 xoa Shadow Copy (tu cmdline con)");
+            LOG_I("      cmdline: %s", ws2s(cmd.substr(0, 120)).c_str());
+        }
+        if (safeMode) {
+            pf.Raise(pf.f6_safeModeDisable, "F6 vo hieu Safe Mode (tu cmdline con)");
+            LOG_I("      cmdline: %s", ws2s(cmd.substr(0, 120)).c_str());
+        }
     }
-    if (safeMode) {
-        pf.Raise(pf.f6_safeModeDisable, "F6 vo hieu Safe Mode (tu cmdline con)");
-        LOG_I("      cmdline: %s", ws2s(cmd.substr(0, 120)).c_str());
-    }
+
+    TriggerVerdict(root);
 }
 
 /* ==========================================================================
    XỬ LÝ EVENT — điểm vào từ driver
    ========================================================================== */
 static ULONG OnEvent(const RW_EVENT& ev) {
-    /* ---------- Event tiến trình ---------- */
+    g_EvTotal++;
+    if (ev.IsPending) g_EvPend++;
+
     if (ev.Action == RwActionProcessCreate) {
         HandleProcessCreate(ev);
         DWORD pid = ev.Pid;
@@ -632,18 +736,72 @@ static ULONG OnEvent(const RW_EVENT& ev) {
     DWORD root = ev.RootPid ? ev.RootPid : ev.Pid;
 
     /* =====================================================================
-       NHÁNH 1 — CoW ENGINE
-       IRP đang pend => file GỐC CHƯA BỊ GHI. Backup ngay, rồi CONTINUE.
-       Không chờ điểm. Không gọi ML. Không phụ thuộc Flask.
+       [FIX 11] NHÁNH 0 — MỞ ĐỌC (KHÔNG PEND)
+       =====================================================================
+       Chaos đọc file gốc rồi ghi ra file mới. Đây là tín hiệu duy nhất đến
+       ĐÚNG LÚC. Không backup, không DENY — chỉ tính điểm.
+
+       Honey file: chạm là đủ. Không ai có lý do chính đáng để mở nó.
+       ===================================================================== */
+    if (ev.Action == RwActionRead) {
+        g_EvRead++;
+
+        /* Honey tripwire — tín hiệu nhanh nhất của cả hệ thống */
+        CheckHoneyTouch(pid, root, path, "doc");
+
+        /* Đếm mật độ đọc vào F10: ransomware đọc hàng loạt file giá trị */
+        {
+            std::lock_guard<std::mutex> lk(g_Mtx);
+            auto& pf = EnsurePf(root, root);
+            pf.ioOps.Add();
+            if (pf.ioOps.Rate() > cfg::RATE_IO_THRESHOLD)
+                pf.Raise(pf.f10_highIo, "F10 doc/ghi file mat do cao");
+
+            std::wstring ext = GetExtension(path);
+            if (!ext.empty()) pf.affectedExts.insert(ext);
+        }
+
+        TriggerVerdict(root);
+        return RwReplyContinue;   /* event này vốn không pend, reply bị bỏ qua */
+    }
+
+    /* =====================================================================
+       NHÁNH 1 — CoW ENGINE (IRP đang pend)
        ===================================================================== */
     if (ev.IsPending) {
-        /* Honey tripwire chạy TRƯỚC — nhánh này vốn return sớm nên khối F4
-           trong Dynamic Analysis không bao giờ tới lượt cho first-touch. */
-        CheckHoneyTouch(pid, root, path);
+        LOG_D("[COW-PEND] pid=%lu act=%lu disp=%lu key=%lld %s",
+            pid, ev.Action, ev.DirEntryCount, ev.FileRef,
+            ws2s(GetFileNameOnly(path)).c_str());
 
-        g_Cow->OnFirstTouch(pid, path, root);   /* root để đăng ký entry vào RootPid */
-        MaybeCallML(root);   /* F4 vừa bật -> cho ML cơ hội nếu đủ ngưỡng */
-        return RwReplyContinue;      /* <<< KẾT THÚC. Nhánh này không đi đâu nữa. */
+        bool isHoney = CheckHoneyTouch(pid, root, path, "ghi");
+
+        /*
+         * [FIX 12] KHÔNG BACKUP HONEY FILE.
+         * 110 honey file đều là .txt/.xlsx/.pdf -> nằm trong VALUABLE_EXTS.
+         * Backup chúng chỉ ngốn quota của tiến trình thật. Honey là BẪY,
+         * mất cũng không sao — điểm đã được cộng rồi.
+         */
+        if (isHoney) {
+            LOG_D("[COW-SKIP] honey_file      %s", ws2s(path).c_str());
+            TriggerVerdict(root);
+            return RwReplyContinue;
+        }
+
+        bool ok = g_Cow->OnFirstTouch(pid, path, root, ev.DirEntryCount);
+
+        TriggerVerdict(root);
+
+        if (!ok) {
+            g_CowFail++;
+            int score = ScoreOf(root);
+            if (score >= cfg::SCORE_FREEZE) {
+                g_CowDeny++;
+                LOG_W("[COW] KHONG CO BAN SAO + score=%d -> DENY IRP: %s",
+                    score, ws2s(GetFileNameOnly(path)).c_str());
+                return RwReplyDeny;
+            }
+        }
+        return RwReplyContinue;
     }
 
     /* =====================================================================
@@ -651,14 +809,12 @@ static ULONG OnEvent(const RW_EVENT& ev) {
        ===================================================================== */
     {
         std::lock_guard<std::mutex> lk(g_Mtx);
-        /* childPf: cho CoW (backup theo pid thật)
-           pf: RootPid nhận toàn bộ điểm — điểm con merge về cha */
         auto& childPf = EnsurePf(pid, root);
         ProcessFeature& pf = (root != pid)
             ? EnsurePf(root, root)
             : childPf;
 
-        /* ---- F9: Directory enumeration (nguồn THẬT: IRP_MJ_DIRECTORY_CONTROL) ---- */
+        /* ---- F9: Directory enumeration ---- */
         if (ev.Action == RwActionDirQuery) {
             pf.dirEntries.Add((int)ev.DirEntryCount);
             if (pf.dirEntries.Rate() > cfg::RATE_DIRENT_THRESHOLD)
@@ -666,22 +822,16 @@ static ULONG OnEvent(const RW_EVENT& ev) {
             return RwReplyContinue;
         }
 
-        /* ---- F8: Registry persistence (nguồn THẬT: CmRegisterCallbackEx) ---- */
+        /* ---- F8: Registry persistence ---- */
         if (ev.Action == RwActionRegPersist) {
-            /*
-             * Chỉ tính F8 khi root đang bị theo dõi VÀ có điểm > 0.
-             * Lý do: svchost.exe, Windows Update, installer hợp lệ cũng
-             * ghi vào RunOnce — nếu không lọc sẽ bị false positive F8.
-             * Tiến trình chạy trước RansomWall (PID=920...) không có entry
-             * trong g_Collector -> bỏ qua hoàn toàn.
-             */
             auto it = g_Collector.find(root);
             if (it != g_Collector.end() && it->second.totalScore > 0) {
                 it->second.Raise(it->second.f8_registryPersist, "F8 registry persistence");
                 LOG_I("      key: %s", ws2s(path.substr(0, 100)).c_str());
             }
             else {
-                LOG_D("[F8] Bo qua PID=%lu (khong theo doi / score=0) key: %s",
+                LOG_TD("f8_skip", 20000,
+                    "[F8] Bo qua PID=%lu (khong theo doi / score=0) key: %s",
                     root, ws2s(path.substr(0, 80)).c_str());
             }
             return RwReplyContinue;
@@ -693,14 +843,16 @@ static ULONG OnEvent(const RW_EVENT& ev) {
         /* ---- F4: Honey file ---- */
         if (isHoney) {
             if (HoneyFiles::IsWhitelisted(pid)) {
-                LOG_D("      Honey bi cham boi tien trinh whitelist -> bo qua");
+                LOG_TD("honey_wl2", 10000,
+                    "      Honey bi cham boi tien trinh whitelist (PID=%lu) -> bo qua", pid);
                 return RwReplyContinue;
             }
-            pf.Raise(pf.f4_honeyModified, "F4 honey file bi sua doi");
-            LOG_I("      honey: %s", ws2s(GetFileNameOnly(path)).c_str());
+            pf.Raise(pf.f4_honeyModified, "F4 honey file bi cham");
+            LOG_A("      *** HONEY: %s *** PID=%lu",
+                ws2s(GetFileNameOnly(path)).c_str(), pid);
         }
 
-        /* ---- F10: High I/O — theo TỐC ĐỘ, không phải tổng tích luỹ ---- */
+        /* ---- F10: High I/O ---- */
         if (!isHoney) {
             pf.ioOps.Add();
             if (pf.ioOps.Rate() > cfg::RATE_IO_THRESHOLD)
@@ -720,13 +872,11 @@ static ULONG OnEvent(const RW_EVENT& ev) {
             }
         }
 
-        /* ---- F12 + F13: metadata từ childPf (CoW backup theo pid thật)
-           Raise và entropyDelta cập nhật lên pf (RootPid) */
+        /* ---- F12 + F13 ---- */
         if ((ev.Action == RwActionWrite || ev.Action == RwActionRename) && !isHoney) {
             if (!pf.f12_fingerprintMismatch.value && CheckFingerprint(childPf, path))
                 pf.Raise(pf.f12_fingerprintMismatch, "F12 dau van tay file khong khop");
-            /* Tính delta từ childPf (có baseline CoW), cập nhật mean vào cả hai.
-               Bỏ qua tính entropy nếu F13 đã bật — tránh spam log Browse.VC.db */
+
             if (!pf.f13_highEntropy.value) {
                 const BackupEntry* e = g_Cow->FindEntry(childPf, path);
                 if (e) {
@@ -746,17 +896,7 @@ static ULONG OnEvent(const RW_EVENT& ev) {
                 }
             }
 
-            /*
-             * F14 — Differential Area Analysis (Davies et al., arXiv:2106.14418)
-             *
-             * Tính trên MỖI FILE lần đầu bị ghi — đúng theo thiết kế bài báo.
-             * Ransomware tạo file mã hoá mới → DAA thấp → cộng điểm.
-             *
-             * Tránh lag: chỉ tính trên VALUABLE_EXTS và dùng IsPending
-             * (CoW đã pend IRP → file chưa bị ghi → đọc được nội dung mã hoá thật).
-             * Mỗi file chỉ tính 1 lần nhờ FirstTouchTable của kernel.
-             * Nếu F14 đã bật thì dừng — không cần tính thêm.
-             */
+            /* F14 — Differential Area Analysis (Davies et al., arXiv:2106.14418) */
             if (!pf.f14_daa.value && cfg::VALUABLE_EXTS.count(ext)) {
                 double daa = DifferentialAreaAnalysis(path);
                 if (daa < cfg::DAA_THRESHOLD) {
@@ -770,58 +910,38 @@ static ULONG OnEvent(const RW_EVENT& ev) {
         if (pf.totalScore >= cfg::SCORE_FREEZE && !pf.backupFrozen)
             pf.backupFrozen = true;
 
-        if (pf.totalScore >= 4 && pf.totalScore < cfg::SCORE_ML_TRIGGER)
-            LOG_W("[DANGER] PID=%lu score=%d/14 — vung nguy hiem, tiep tuc theo doi.",
-                root, pf.totalScore);
+        if (pf.totalScore >= 4 && pf.totalScore < cfg::SCORE_ML_TRIGGER) {
+            static std::atomic<uint64_t> lastDanger{ 0 };
+            uint64_t now = GetTickCount64(), prev = lastDanger.load();
+            if (now - prev > 1000 &&
+                lastDanger.compare_exchange_strong(prev, now)) {
+                int sc = pf.totalScore; DWORD r = root;
+                LOG_W("[DANGER] PID=%lu score=%d/14", r, sc);
+            }
+        }
     }
 
-    MaybeCallML(root);     /* gọi ML trên RootPid, không phải pid con */
+    TriggerVerdict(root);
     return RwReplyContinue;
 }
 
 /* ==========================================================================
    GIAI ĐOẠN 1 — NEW EXECUTABLE WATCHER
-   ==========================================================================
-   Chỉ phân tích file thực thi XUẤT HIỆN SAU KHI RansomWall khởi động
-   (tải về, giải nén, copy từ USB). File đã có sẵn từ trước KHÔNG quét.
-
-   Giả định: RansomWall chạy TRƯỚC khi mối đe doạ tới — mô hình real-time
-   protection tiêu chuẩn.
-
-   VÌ SAO phải quét lúc file rơi xuống, không đợi nó chạy:
-     Nếu chỉ dựa vào process create:
-       t=0ms     ransomware.exe chạy
-       t=5000ms  DIE xong
-       t=25000ms FLOSS xong -> F1/F2/F3 mới bật
-     25 giây đó ransomware đã mã hoá xong. Điểm tĩnh về vô nghĩa.
    ========================================================================== */
-
-   /* ==========================================================================
-      CHỜ FILE GHI XONG
-      ==========================================================================
-      LỖI ĐÃ SỬA (bỏ lỡ file giải nén từ zip có mật khẩu):
-        - Timeout 4.5s là con số BỊA, không cơ sở. Gõ mật khẩu, file lớn, hay
-          VM ARM64 emulated đều vượt xa.
-        - GetFileAttributesEx fail -> return false NGAY, không phân biệt
-          "file bị xoá thật" với "đang bị khoá một nhịp".
-        - Size ổn định MỘT lần đã thử mở -> quá vội.
-        - Thất bại là mất luôn, không có đường quay lại.
-      ========================================================================== */
 enum class SettleResult { Ready, Gone, Timeout };
 
 static SettleResult WaitFileSettled(const std::wstring& path, int timeoutMs) {
     ULONGLONG start = GetTickCount64();
     ULONGLONG deadline = start + timeoutMs;
     uint64_t  last = UINT64_MAX;
-    int  stable = 0;    /* số nhịp liên tiếp size không đổi */
-    int  missing = 0;    /* số nhịp liên tiếp không thấy file */
+    int  stable = 0;
+    int  missing = 0;
     bool logged = false;
 
     while (GetTickCount64() < deadline) {
         WIN32_FILE_ATTRIBUTE_DATA fad{};
         if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) {
             DWORD e = GetLastError();
-            /* Chỉ kết luận "biến mất" khi NOT_FOUND nhiều nhịp liên tiếp */
             if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) {
                 if (++missing >= 4) return SettleResult::Gone;
             }
@@ -833,17 +953,11 @@ static SettleResult WaitFileSettled(const std::wstring& path, int timeoutMs) {
 
         if (sz > 0 && sz == last) {
             stable++;
-            /* Size đứng yên >= 2 nhịp -> thử mở ĐỘC QUYỀN: chắc không ai còn ghi */
             if (stable >= 2) {
                 HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, 0, nullptr,
                     OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
                 if (h != INVALID_HANDLE_VALUE) { CloseHandle(h); return SettleResult::Ready; }
             }
-            /*
-             * Vẫn bị giữ handle nhưng size đã đứng yên 4 giây.
-             * Chấp nhận đọc chia sẻ — thà phân tích còn hơn bỏ lỡ.
-             * (7-Zip / trình duyệt giữ handle lâu sau khi ghi xong)
-             */
             if (stable >= 8) {
                 LOG_D("[NEWEXE] %s: size on dinh nhung con bi giu handle "
                     "-> phan tich bang doc chia se.",
@@ -866,21 +980,10 @@ static SettleResult WaitFileSettled(const std::wstring& path, int timeoutMs) {
     return SettleResult::Timeout;
 }
 
-/*
- * IsToolUnpackDir — thư mục do CHÍNH công cụ của ta bung ra.
- *
- * LỖI ĐÃ SỬA (flood _MEI189322 trong log):
- *   floss.exe là app Python đóng gói bằng PyInstaller. Khi chạy, nó giải nén
- *   mấy chục DLL runtime vào %TEMP%\_MEI<pid>\ -> watcher thấy "file thuc thi
- *   MOI" cho từng cái -> phân tích hết -> ngập log.
- *   RansomWall lại tự gây nhiễu cho chính mình.
- *
- * IsOwnTool không bắt được vì _MEI nằm ở Temp, không nằm trong thư mục module.
- */
 static bool IsToolUnpackDir(const std::wstring& path) {
     std::wstring low = ToLower(path);
-    if (low.find(L"\\_mei") != std::wstring::npos) return true;   /* PyInstaller */
-    if (low.find(L"\\onefile_") != std::wstring::npos) return true;   /* Nuitka */
+    if (low.find(L"\\_mei") != std::wstring::npos) return true;
+    if (low.find(L"\\onefile_") != std::wstring::npos) return true;
     return false;
 }
 
@@ -896,7 +999,6 @@ static void OnNewExecutable(std::wstring path) {
     if (sr == SettleResult::Timeout) {
         LOG_W("[NEWEXE] HET GIO CHO (%ds) — KHONG quet duoc: %s",
             cfg::NEWEXE_SETTLE_TIMEOUT_MS / 1000, ws2s(path).c_str());
-        LOG_W("         File nay chi duoc quet KHI NO CHAY (muon).");
         return;
     }
     WIN32_FILE_ATTRIBUTE_DATA fad{};
@@ -909,7 +1011,6 @@ static void OnNewExecutable(std::wstring path) {
 
     int pre = StaticScore(r);
 
-    /* File sạch: log mức DEBUG. Chỉ file đáng ngờ mới ALERT. */
     if (pre == 0) {
         LOG_D("[NEWEXE] %s: 0/5 — sach.", ws2s(GetFileNameOnly(path)).c_str());
         return;
@@ -919,8 +1020,7 @@ static void OnNewExecutable(std::wstring path) {
             ws2s(GetFileNameOnly(path)).c_str(), pre);
         return;
     }
-    LOG_A("[NEWEXE] !!! %s co %d/5 dau hieu tinh — DA CACHE truoc khi chay. "
-        "Neu chay, no se dat nguong ML rat nhanh.",
+    LOG_A("[NEWEXE] !!! %s co %d/5 dau hieu tinh — DA CACHE truoc khi chay.",
         ws2s(GetFileNameOnly(path)).c_str(), pre);
 }
 
@@ -938,8 +1038,7 @@ static void NewExecutableWatcher(const std::wstring& dir) {
     while (g_Running) {
         DWORD ret = 0;
         if (!ReadDirectoryChangesW(h, buf.data(), (DWORD)buf.size(),
-            TRUE,   /* đệ quy — bắt cả file giải nén vào thư mục con */
-            FILE_NOTIFY_CHANGE_FILE_NAME,
+            TRUE, FILE_NOTIFY_CHANGE_FILE_NAME,
             &ret, nullptr, nullptr)) break;
         if (ret == 0) continue;
 
@@ -963,11 +1062,7 @@ static void NewExecutableWatcher(const std::wstring& dir) {
 }
 
 /* ==========================================================================
-   CHẾ ĐỘ SIMULATION — khi driver chưa load
-   ==========================================================================
-   ReadDirectoryChangesW KHÔNG cho biết PID nào gây ra thay đổi, và KHÔNG
-   pend được. Backup có thể chậm hơn ransomware (xem mục 3.2 của báo cáo).
-   Chỉ dùng để TEST LOGIC, không phải bảo vệ thật.
+   CHẾ ĐỘ SIMULATION
    ========================================================================== */
 static void SimulationWatcher(const std::wstring& dir) {
     HANDLE h = CreateFileW(dir.c_str(), FILE_LIST_DIRECTORY,
@@ -994,21 +1089,22 @@ static void SimulationWatcher(const std::wstring& dir) {
             std::wstring full = dir + L"\\" + name;
 
             RW_EVENT ev{};
-            ev.Pid = GetCurrentProcessId();   /* SIM: không biết PID thật */
+            ev.Pid = GetCurrentProcessId();
             ev.RootPid = ev.Pid;
             ev.IsPending = 0;
             wcsncpy_s(ev.FilePath, full.c_str(), _TRUNCATE);
 
             switch (n->Action) {
-            case FILE_ACTION_MODIFIED:        ev.Action = RwActionWrite;  break;
-            case FILE_ACTION_RENAMED_NEW_NAME:ev.Action = RwActionRename; break;
-            case FILE_ACTION_REMOVED:         ev.Action = RwActionDelete; break;
-            case FILE_ACTION_ADDED:           ev.Action = RwActionWrite;  break;
+            case FILE_ACTION_MODIFIED:         ev.Action = RwActionWrite;  break;
+            case FILE_ACTION_RENAMED_NEW_NAME: ev.Action = RwActionRename; break;
+            case FILE_ACTION_REMOVED:          ev.Action = RwActionDelete; break;
+            case FILE_ACTION_ADDED:            ev.Action = RwActionWrite;  break;
             default: ev.Action = RwActionNone;
             }
             if (ev.Action != RwActionNone) {
-                /* SIM: giả lập first-touch bằng cách thử backup mọi file mới thấy */
-                g_Cow->OnFirstTouch(ev.Pid, full);
+                /* [FIX 12] honey không cần backup */
+                if (!g_Honey.IsHoney(full))
+                    g_Cow->OnFirstTouch(ev.Pid, full);
                 OnEvent(ev);
             }
             if (n->NextEntryOffset == 0) break;
@@ -1027,24 +1123,11 @@ static void MaintenanceThread() {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         tick++;
 
-        /* Heartbeat — phân biệt crash vs thoát sạch */
         if (tick % cfg::HEARTBEAT_INTERVAL_SEC == 0) CleanupEngine::WriteHeartbeat();
-
-        /*
-         * Ghi gộp manifest — NGOÀI đường pend.
-         * Trước đây WriteManifest() chạy trong CowEngine::OnFirstTouch, dưới
-         * global mutex, kèm FlushFileBuffers -> mỗi file backup ép flush đĩa
-         * trong lúc IRP đang treo chờ. Đây là một trong các nguyên nhân máy lag.
-         */
         if (tick % 5 == 0) g_Cow->FlushDirtyManifests();
-
-        /* (1) Early cleanup */
         if (tick % cfg::EARLY_CLEANUP_INTERVAL_SEC == 0) g_Clean->EarlyCleanupPass();
-
-        /* (2) Exit cleanup */
         if (tick % 15 == 0) g_Clean->ExitCleanupPass();
 
-        /* Đo lại disk budget */
         if (tick % cfg::DISK_RECHECK_SEC == 0) {
             g_Cow->RefreshBudget();
             if (g_Filter && g_Filter->IsConnected()) {
@@ -1052,28 +1135,56 @@ static void MaintenanceThread() {
                 else                       g_Filter->ResumeCow();
             }
         }
-
-        /* Decay các cờ DYNAMIC */
-        if (tick % 5 == 0) {
-            std::lock_guard<std::mutex> lk(g_Mtx);
-        }
     }
 }
 
 static void StatusThread() {
     while (g_Running) {
         std::this_thread::sleep_for(std::chrono::seconds(20));
-        std::lock_guard<std::mutex> lk(g_Mtx);
-        size_t tracked = g_Collector.size(), backed = 0;
+        size_t tracked = 0, backed = 0;
         uint64_t bytes = 0;
         int maxScore = 0; DWORD maxPid = 0;
-        for (auto& [pid, pf] : g_Collector) {
-            backed += pf.entries.size();
-            bytes += pf.quotaUsed;
-            if (pf.totalScore > maxScore) { maxScore = pf.totalScore; maxPid = pid; }
+        {
+            std::lock_guard<std::mutex> lk(g_Mtx);
+            tracked = g_Collector.size();
+
+            /*
+             * [FIX 17] ĐẾM THEO ĐƯỜNG DẪN DUY NHẤT.
+             *
+             * OnFirstTouch đăng ký MỖI entry HAI LẦN khi rootPid != pid:
+             * một lần vào PID con, một lần vào RootPid (để RestoreFiles tìm
+             * thấy). Cộng dồn entries.size() qua mọi PID -> đếm gấp đôi.
+             *
+             * Log Akira báo backup=128 nhưng thực tế chỉ ~64 file.
+             * quotaUsed thì đúng (chỉ cộng ở PID con) nên không đổi.
+             */
+            std::set<std::wstring> uniq;
+            for (auto& [pid, pf] : g_Collector) {
+                for (auto& e : pf.entries) uniq.insert(ToLower(e.originalPath));
+                bytes += pf.quotaUsed;
+                if (pf.totalScore > maxScore) { maxScore = pf.totalScore; maxPid = pid; }
+            }
+            backed = uniq.size();
         }
-        LOG_I("[STATUS] tien-trinh=%zu  backup=%zu file (%llu MB)  score cao nhat=%d (PID=%lu)",
-            tracked, backed, bytes / 1048576, maxScore, maxPid);
+        uint64_t ghost = g_Cow ? g_Cow->GhostMissCount() : 0;
+        uint64_t lateRep = g_Filter ? g_Filter->LateReplyCount() : 0;
+        uint64_t badRep = g_Filter ? g_Filter->ReplyFailCount() : 0;
+
+        LOG_I("[STATUS] tien-trinh=%zu  backup=%zu file (%llu MB)  score cao nhat=%d (PID=%lu)  "
+            "events=%llu pend=%llu read=%llu  cow-fail=%llu cow-deny=%llu  ghost-miss=%llu  "
+            "reply-muon=%llu reply-loi=%llu",
+            tracked, backed, bytes / 1048576, maxScore, maxPid,
+            g_EvTotal.load(), g_EvPend.load(), g_EvRead.load(),
+            g_CowFail.load(), g_CowDeny.load(), ghost, lateRep, badRep);
+
+        if (ghost > 0) {
+            LOG_E("[STATUS] *** GHOST-MISS=%llu *** getattr tra err=2 cho file CO THAT. "
+                "Doc cac dong [PROBE] de biet nguyen nhan chinh xac.", ghost);
+        }
+        if (badRep > 0) {
+            LOG_E("[STATUS] *** REPLY-LOI=%llu *** co IRP pend khong duoc tra loi dung. "
+                "CoW dang thung.", badRep);
+        }
     }
 }
 
@@ -1085,16 +1196,42 @@ int wmain() {
     SetConsoleCP(CP_UTF8);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
-    /* Ghi log ra file song song console — flush chỉ khi WARN/ERROR/ALERT */
     rw::Logger::I().SetLogFile(GetModuleDir() + L"\\ransomwall.log");
+
+    /* ======================================================================
+       [FIX 19] MỨC LOG TÁCH RIÊNG CONSOLE VÀ FILE
+       ======================================================================
+       Console: Info trở lên — người dùng theo dõi, không cần thấy DEBUG.
+       File   : Debug đầy đủ — để phân tích sau khi chạy xong.
+
+       Đổi RW_QUIET_CONSOLE thành 1 nếu muốn console CHỈ hiện cảnh báo trở lên
+       (dùng khi chạy mẫu nhanh liên tiếp, console cuộn quá nhanh để đọc).
+
+       Muốn file cũng gọn (log nhỏ hơn nhiều): SetFileLevel(LogLevel::Info).
+       ====================================================================== */
+#define RW_QUIET_CONSOLE 0
+
+#if RW_QUIET_CONSOLE
+    rw::Logger::I().SetConsoleLevel(rw::LogLevel::Warn);
+#else
+    rw::Logger::I().SetConsoleLevel(rw::LogLevel::Info);
+#endif
+    rw::Logger::I().SetFileLevel(rw::LogLevel::Debug);
 
     printf("\n");
     printf("  ==========================================\n");
-    printf("        RansomWall v4.0\n");
-    printf("     CoW Engine + 13 Features + ML\n");
+    printf("        RansomWall v4.4\n");
+    printf("     CoW Engine + 14 Features + ML\n");
+#if RW_BYPASS_ML
+    printf("     *** CHE DO BO QUA ML (score>=%d = KILL) ***\n", cfg::SCORE_ML_TRIGGER);
+#endif
     printf("  ==========================================\n\n");
 
-    /* --- Kiểm tra quyền admin --- */
+#if RW_BYPASS_ML
+    LOG_W("[!] RW_BYPASS_ML=1 — score >= %d se KILL NGAY khong hoi ML.",
+        cfg::SCORE_ML_TRIGGER);
+#endif
+
     BOOL isAdmin = FALSE;
     PSID adminGrp = nullptr;
     SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
@@ -1109,31 +1246,32 @@ int wmain() {
         (void)getchar();
         return 1;
     }
+    SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
+
+    /* [FIX 15] Bắt buộc phải bật TRƯỚC khi có bất kỳ lần kill nào.
+       Không có nó, ransomware tự đặt DACL sẽ sống sót (err=5). */
+    if (EnableDebugPrivilege()) {
+        LOG_I("[*] Da bat SeDebugPrivilege — kill duoc ca tien trinh tu bao ve.");
+    }
+    else {
+        LOG_W("[!] KHONG bat duoc SeDebugPrivilege (err=%lu). Tien trinh dat DACL "
+            "tu choi PROCESS_TERMINATE se KHONG kill duoc.", GetLastError());
+    }
 
     g_Cow = std::make_unique<CowEngine>(g_Mtx, g_Collector);
     g_Clean = std::make_unique<CleanupEngine>(g_Mtx, g_Collector, *g_Cow);
     g_Filter = std::make_unique<FilterClient>();
 
-    /* --- (4) Orphan sweep: PHẢI chạy TRƯỚC khi nhận event --- */
     LOG_I("[*] Quet backup mo coi tu phien truoc...");
     g_Clean->OrphanSweep();
     CleanupEngine::ClearHeartbeat();
 
-    /* --- Honey files --- */
     LOG_I("[*] Tao honey files...");
     g_Honey.Create();
 
-    /* ================================================================
-       GIAI ĐOẠN 1 — TĨNH: file trên đĩa, TRƯỚC khi chạy
-       ================================================================
-         1a. Quét ban đầu : file đã có sẵn lúc khởi động
-         1b. Watcher      : file mới rơi xuống sau đó
-       Cả hai cache theo SHA-256 -> khi tiến trình chạy, điểm tĩnh áp NGAY.
-       ================================================================ */
     for (auto& d : StaticScanDirs())
         std::thread(NewExecutableWatcher, d).detach();
 
-    /* --- Kết nối driver --- */
     LOG_I("[*] Ket noi kernel driver...");
     if (g_Filter->Connect()) {
         g_DriverMode = true;
@@ -1145,8 +1283,6 @@ int wmain() {
     else {
         g_DriverMode = false;
         LOG_W("[!] CHE DO SIMULATION — driver chua load.");
-        LOG_W("    ReadDirectoryChangesW KHONG biet PID that va KHONG pend duoc.");
-        LOG_W("    Backup co the CHAM HON ransomware. Chi dung de test logic.");
         LOG_W("    De bat kernel mode:  sc start RansomWallDriver");
 
         for (auto& d : { Downloads(), Documents(), Desktop() })
@@ -1163,10 +1299,11 @@ int wmain() {
 
     g_Running = false;
     if (g_Filter) g_Filter->Disconnect();
-    if (g_Cow)    g_Cow->FlushDirtyManifests();   /* ghi nốt trước khi thoát */
-    CleanupEngine::ClearHeartbeat();   /* thoát sạch -> xoá .session */
+    if (g_Cow)    g_Cow->FlushDirtyManifests();
+    CleanupEngine::ClearHeartbeat();
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     CoUninitialize();
     LOG_I("Da thoat.");
+    rw::Logger::I().Flush();   /* [FIX 19] xa bo dem dong lap cuoi cung */
     return 0;
 }

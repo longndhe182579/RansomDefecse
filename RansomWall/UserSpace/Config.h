@@ -1,6 +1,17 @@
 /*
  * Config.h — Mọi hằng số ngưỡng tập trung một chỗ.
  * Sửa ở đây, không rải magic number khắp code.
+ *
+ * ===========================================================================
+ * BẢN VÁ v4.1 — sửa lỗi "có con backup được, có con không"
+ * ===========================================================================
+ *   [FIX 3] MAX_BACKUP_FILE_SIZE: 50MB -> 512MB, chia 2 bậc theo score.
+ *           Chaos wipe file lớn bằng rác; trần 50MB cứng = mất trắng file lớn.
+ *   [FIX 4] VALUABLE_EXTS mở rộng mạnh. Driver KHÔNG pend đuôi ngoài danh sách
+ *           -> user-space không bao giờ thấy file -> không có cửa nào backup.
+ *           DANH SÁCH NÀY PHẢI KHỚP gValuableExts TRONG Driver.c.
+ *   [FIX 2] Thêm hằng số retry cho CopyFileShared khi ERROR_SHARING_VIOLATION.
+ * ===========================================================================
  */
 #pragma once
 #include <string>
@@ -26,18 +37,95 @@ namespace rw::cfg {
     constexpr int SCORE_FREEZE = 2;   // đóng băng backup, tắt LRU
     constexpr int SCORE_CLEANUP_MAX = 1;   // <= giá trị này thì early cleanup được phép
 
-    /* ---------- CoW: điều kiện backup ---------- */
-    constexpr uint64_t MAX_BACKUP_FILE_SIZE = 50ull * 1024 * 1024;   // 50MB
+    /* ======================================================================
+       [FIX 3] CoW: trần kích thước file backup — HAI BẬC
+       ======================================================================
+       Trần 50MB cứng của v4.0 là nguyên nhân mất trắng file lớn:
+       Chaos (và các biến thể wiper) GHI ĐÈ file lớn bằng rác thay vì mã hoá.
+       File > 50MB rơi vào COW_BAIL("size_too_big") -> không có bản sao nào.
 
+       Bậc thấp (score <= 1): giữ 50MB để không phình store vì tiến trình sạch.
+       Bậc cao (score >= SCORE_FREEZE): đã nghi ngờ -> nới lên 512MB, cứu được
+       gì thì cứu. Quota động (TIER0..TIER3) vẫn là hàng rào chặn phình.
+       ====================================================================== */
+    constexpr uint64_t MAX_BACKUP_FILE_SIZE = 512ull * 1024 * 1024;   // 512MB — score >= 2
+    constexpr uint64_t MAX_BACKUP_FILE_SIZE_CLEAN = 50ull * 1024 * 1024;   //  50MB — score <= 1
+
+    /* ======================================================================
+       [FIX 2] Retry copy khi file bị giữ handle
+       ======================================================================
+       CopyFileShared vẫn fail nếu ransomware mở file với dwShareMode = 0
+       (deny-all). Share mode là thoả thuận HAI CHIỀU — không handle mới nào
+       mở được. Retry ngắn để vượt qua trường hợp file chỉ bị khoá một nhịp.
+
+       NGÂN SÁCH THỜI GIAN: driver timeout 200ms (RW_REPLY_TIMEOUT_100NS).
+       3 lần x 30ms = 90ms — vẫn còn chỗ cho bản thân thao tác copy.
+       KHÔNG được nâng quá tay, vượt 200ms là driver fail-open và file mất.
+       ====================================================================== */
+    constexpr int COW_COPY_RETRY_COUNT = 3;
+    constexpr int COW_COPY_RETRY_SLEEP_MS = 30;
+
+    /* ======================================================================
+       [FIX 4] VALUABLE_EXTS — PHẢI KHỚP gValuableExts TRONG Driver.c
+       ======================================================================
+       Driver chỉ pend IRP khi đuôi file nằm trong danh sách. Đuôi ngoài danh
+       sách -> KHÔNG pend -> CoW không bao giờ chạy -> mất file, im lặng.
+
+       Đây là lý do "con này backup được, con kia không": ransomware nào quét
+       đúng bộ đuôi của ta thì ta cứu được; con nào quét rộng hơn thì thủng
+       đúng phần chênh lệch.
+
+       Whitelist đuôi về bản chất là mô hình THUA (ta luôn chạy sau kẻ tấn công).
+       Xem RW_COW_BLACKLIST_MODE trong Driver.c nếu muốn đổi sang blacklist.
+       ====================================================================== */
     inline const std::set<std::wstring> VALUABLE_EXTS = {
-        L".doc",  L".docx", L".xls",  L".xlsx", L".ppt",  L".pptx",
-        L".pdf",  L".txt",  L".rtf",  L".odt",  L".csv",  L".md",
-        L".jpg",  L".jpeg", L".png",  L".gif",  L".bmp",  L".psd", L".raw",
-        L".mp3",  L".mp4",  L".avi",  L".mov",  L".wav",
-        L".zip",  L".rar",  L".7z",   L".tar",  L".gz",
-        L".sql",  L".db",   L".mdb",  L".accdb",L".json", L".xml",
+        /* --- Tài liệu --- */
+        L".doc",  L".docx", L".docm", L".dot",  L".dotx", L".odt",
+        L".xls",  L".xlsx", L".xlsm", L".xlt",  L".xltx", L".ods",
+        L".ppt",  L".pptx", L".pptm", L".pps",  L".ppsx", L".odp",
+        L".pdf",  L".txt",  L".rtf",  L".csv",  L".md",   L".tex",
+        L".one",  L".pages",L".numbers",
+
+        /* --- Ảnh / thiết kế --- */
+        L".jpg",  L".jpeg", L".png",  L".gif",  L".bmp",  L".psd",
+        L".raw",  L".tif",  L".tiff", L".webp", L".heic", L".svg",
+        L".ico",  L".ai",   L".eps",  L".cr2",  L".nef",  L".arw", L".dng",
+
+        /* --- Media --- */
+        L".mp3",  L".mp4",  L".avi",  L".mov",  L".wav",  L".mkv",
+        L".flac", L".m4a",  L".wmv",  L".flv",  L".webm", L".m4v",
+        L".aac",  L".ogg",
+
+        /* --- Nén / ảnh đĩa --- */
+        L".zip",  L".rar",  L".7z",   L".tar",  L".gz",   L".bz2",
+        L".xz",   L".iso",  L".cab",
+
+        /* --- CSDL --- */
+        L".sql",  L".db",   L".mdb",  L".accdb",L".sqlite", L".sqlite3",
+        L".mdf",  L".ldf",  L".dbf",  L".frm",  L".myd",  L".bak",
+
+        /* --- Dữ liệu / cấu hình --- */
+        L".json", L".xml",  L".yaml", L".yml",  L".toml", L".ini",
+        L".cfg",  L".conf", L".env",  L".log",
+
+        /* --- Mã nguồn --- */
         L".cpp",  L".h",    L".c",    L".hpp",  L".cs",   L".py",
         L".js",   L".ts",   L".java", L".php",  L".html", L".css",
+        L".go",   L".rs",   L".rb",   L".sh",   L".pl",   L".lua",
+        L".swift",L".kt",   L".vb",   L".asm",  L".sln",  L".vcxproj",
+
+        /* --- Khoá / chứng chỉ — mất là mất vĩnh viễn --- */
+        L".pem",  L".key",  L".crt",  L".pfx",  L".p12",  L".kdbx", L".ovpn",
+
+        /* --- Mail / lịch / danh bạ --- */
+        L".pst",  L".ost",  L".eml",  L".msg",  L".vcf",  L".ics",
+
+        /* --- CAD / 3D --- */
+        L".vsd",  L".dwg",  L".dxf",  L".skp",  L".stl",  L".obj",
+        L".fbx",  L".blend",
+
+        /* --- Máy ảo — một file = cả hệ thống --- */
+        L".vmdk", L".vdi",  L".vhd",  L".vhdx", L".ova",
     };
 
     /* Không backup file thực thi — chúng không phải mục tiêu của ransomware */
@@ -73,14 +161,14 @@ namespace rw::cfg {
     constexpr int    WINDOW_SEC = 30;
     constexpr double RATE_IO_THRESHOLD = 20.0;  // F10: ops/giây
     constexpr double RATE_RENAME_THRESHOLD = 5.0;   // F11: renames/giây
-    constexpr double RATE_DIRENT_THRESHOLD = 30.0;  // F9:  entries/giây (30 đủ bắt BlackCat/LockBit enum chậm)
+    constexpr double RATE_DIRENT_THRESHOLD = 30.0;  // F9:  entries/giây
 
     /* ---------- Entropy (mục 5.2) ---------- */
     constexpr double ENTROPY_DELTA_THRESHOLD = 2.0;   // F13: ΔH
-    constexpr double ENTROPY_ABS_THRESHOLD = 6.5;   // F13
-    constexpr double DAA_THRESHOLD = 56.0;           // F14: 56 Bit-Bytes (Davies 2021, Table 7)   // F13: H sau (6.5 bắt AES-CBC nhẹ, partial encryption)
+    constexpr double ENTROPY_ABS_THRESHOLD = 6.5;   // F13: H sau
+    constexpr double DAA_THRESHOLD = 56.0;  // F14: 56 Bit-Bytes (Davies 2021, Table 7)
     constexpr double ENTROPY_PACKED_SECTION = 7.0;   // F2:  section thực thi
-    constexpr size_t ENTROPY_SAMPLE_BYTES = 4096;  // F12/F13 đọc 4KB, KHÔNG phải 16 byte
+    constexpr size_t ENTROPY_SAMPLE_BYTES = 4096;  // F12/F13 đọc 4KB
 
     /* ---------- Cleanup (mục 4.1.6) ---------- */
     constexpr int    EARLY_CLEANUP_INTERVAL_SEC = 30;
@@ -103,11 +191,6 @@ namespace rw::cfg {
            <exe_dir>\die\diec.exe   +  <exe_dir>\die\db\
            <exe_dir>\floss.exe
        Không có thì tự động dùng phân tích PE thuần (native).
-
-       Native bắt được packer LẠ (entropy theo section) mà DIE chưa biết.
-       DIE bắt được packer ĐÃ BIẾT chính xác hơn (database hàng nghìn signature).
-       FLOSS bóc được chuỗi dựng trên stack lúc chạy — thứ native KHÔNG làm được,
-       và đó chính là kỹ thuật ransomware dùng để né quét chuỗi tĩnh.
     */
     inline const std::wstring DIE_REL_PATH = L"\\die\\diec.exe";
     inline const std::wstring DIE_DB_REL_PATH = L"\\die\\db";
@@ -118,20 +201,11 @@ namespace rw::cfg {
     constexpr size_t TOOL_MAX_OUTPUT = 8 * 1024 * 1024;
     constexpr uint64_t FLOSS_MAX_FILE_SIZE = 10ull * 1024 * 1024;  // file > 10MB bỏ qua FLOSS
 
-    /* ---------- Watcher file thực thi mới ----------
-       Chỉ phân tích file thực thi XUẤT HIỆN SAU KHI RansomWall khởi động.
-       File đã có sẵn từ trước KHÔNG quét — giả định: RansomWall chạy trước
-       khi mối đe doạ tới. Đây là mô hình real-time protection tiêu chuẩn.
-
-       Khi tiến trình chạy, điểm tĩnh đã sẵn trong cache -> áp ngay lập tức. */
-       /* Thời gian chờ file ghi xong trước khi quét.
-          120s: gõ mật khẩu zip, giải nén file lớn, copy qua mạng, VM emulated...
-          Chờ trên thread nền nên không tốn gì; timeout ngắn thì MẤT file. */
+    /* ---------- Watcher file thực thi mới ---------- */
     constexpr int    NEWEXE_SETTLE_TIMEOUT_MS = 30000;
     constexpr uint64_t NEWEXE_MAX_SIZE = 200ull * 1024 * 1024;
 
-    /* Thư mục hệ thống: KHÔNG quét tĩnh nếu file có chữ ký hợp lệ.
-       Ransomware không nằm ở đây; quét chúng chỉ tốn DIE/FLOSS vô ích. */
+    /* Thư mục hệ thống: KHÔNG quét tĩnh nếu file có chữ ký hợp lệ. */
     inline const std::vector<std::wstring> SYSTEM_DIRS = {
         L"c:\\windows\\",
         L"c:\\program files\\",

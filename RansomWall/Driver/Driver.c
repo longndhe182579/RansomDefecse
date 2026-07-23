@@ -1,18 +1,50 @@
 /*
- * Driver.c — RansomWall Kernel Minifilter v4.0
+ * Driver.c — RansomWall Kernel Minifilter v4.4
  *
- * CHỨC NĂNG:
- *   1. Path blacklist (H1)      — deny cứng vùng hệ thống, không hỏi user-space
- *   2. FirstTouchTable          — pend IRP lần đầu mỗi cặp (PID, FileRef) để CoW backup
- *   3. IRP interceptor          — write / rename / delete / directory query
- *   4. Process tracker          — cây tiến trình, RootPid, command line (F6, F7)
- *   5. Registry callback        — Run/RunOnce/Services (F8)
- *   6. Deny PID enforcement     — sau khi ML kết luận MALWARE
+ * ===========================================================================
+ * BẢN VÁ v4.4 — BẮT THAO TÁC MỞ ĐỌC
+ * ===========================================================================
+ *   [FIX 11] Chaos KHÔNG ghi đè file gốc. Bằng chứng từ log + đĩa:
+ *
+ *              RansomWall.pdb  ->  RansomWall.pdb.1bnp
+ *              (nối thêm đuôi ngẫu nhiên 4 ký tự vào SAU tên gốc đầy đủ)
+ *
+ *            Chuỗi hành động:
+ *              1. Mở file gốc CHỈ ĐỌC        <- PreCreate cũ: !wantsWrite -> THẢ
+ *              2. Mã hoá trong bộ nhớ
+ *              3. Tạo file mới "<goc>.1bnp"  <- FILE_CREATE -> THẢ (đúng)
+ *              4. Xoá file gốc
+ *
+ *            Toàn bộ nằm NGOÀI tầm hook cũ. Log 3 lần chạy không có MỘT event
+ *            rename (act=2) hay delete (act=3) nào. Honey file không bao giờ
+ *            bị chạm vì ta chỉ hook thao tác GHI.
+ *
+ *            SỬA: gửi event RwActionRead khi mở đọc file giá trị.
+ *
+ *            QUAN TRỌNG — event này KHÔNG PEND:
+ *              - FltSendMessage với WaitReply = FALSE
+ *              - IRP không bị chặn, không round-trip 200ms
+ *              - Chi phí chỉ là băng thông message, không phải độ trễ I/O
+ *
+ *            Mục đích DUY NHẤT: user-space kiểm honey file (F4) và đếm mật
+ *            độ I/O. KHÔNG dùng để backup — honey file không cần backup, và
+ *            file thường thì đọc không phá dữ liệu.
+ *
+ *            Key FirstTouch riêng (XOR RW_READ_MARK) để không ăn mất slot
+ *            pend của thao tác ghi sau đó.
+ *
+ * ===========================================================================
+ * BẢN VÁ CŨ (giữ nguyên)
+ * ===========================================================================
+ *   [FIX 4] gValuableExts 141 đuôi, khớp cfg::VALUABLE_EXTS.
+ *   [FIX 5] Key FirstTouchTable thống nhất PathHash64.
+ *   [FIX 6] Bỏ DbgPrint flood.
+ *   [FIX 8] Shell là điểm dừng của chuỗi RootPid.
  *
  * CẢNH BÁO:
  *   - CHỈ chạy trong VM. Lỗi kernel = BSOD, không phải exception.
  *   - Cần: bcdedit /set testsigning on  + reboot
- *   - IRQL: FltSendMessage yêu cầu PASSIVE_LEVEL. Ta kiểm tra trước mỗi lần gọi.
+ *   - IRQL: FltSendMessage yêu cầu PASSIVE_LEVEL.
  *   - Paging I/O KHÔNG được pend (deadlock với memory manager).
  */
 
@@ -23,17 +55,41 @@
 
 #pragma prefast(disable:__WARNING_ENCODE_MEMBER_FUNCTION_POINTER, "Not valid for kernel mode drivers")
 
- /* ==========================================================================
-    GLOBALS
-    ========================================================================== */
+ /*
+  * ===========================================================================
+  * RW_COW_BLACKLIST_MODE — TUỲ CHỌN, MẶC ĐỊNH TẮT
+  * ===========================================================================
+  * Whitelist đuôi file là mô hình THUA: đuôi ngẫu nhiên của Chaos (.1bnp)
+  * không nằm trong danh sách nên bước 3 và 4 đều vô hình.
+  *
+  * Bật cờ này để pend MỌI đuôi TRỪ file thực thi -> F11 (IsMassNewExtension)
+  * bắt được "cùng một đuôi lạ trên >= 5 file" và cộng điểm sớm.
+  *
+  * ĐÁNH ĐỔI: tải I/O tăng đáng kể. ĐỪNG bật cùng lúc với FIX 11 ở lần đo
+  * đầu tiên — máy lag thì không biết cái nào gây ra.
+  * ===========================================================================
+  */
+#define RW_COW_BLACKLIST_MODE 0
+
+  /*
+   * [FIX 11] Bật/tắt event mở đọc. Đặt 0 nếu cần loại trừ nguyên nhân lag.
+   */
+#define RW_TRACK_READ_OPEN 1
+
+   /* Marker XOR để tách không gian key đọc khỏi key ghi */
+#define RW_READ_MARK 0x5245414400000000LL   /* "READ" */
+
+   /* ==========================================================================
+      GLOBALS
+      ========================================================================== */
 
 typedef struct _RW_GLOBALS {
     PFLT_FILTER     Filter;
     PFLT_PORT       ServerPort;
     PFLT_PORT       ClientPort;
 
-    ULONG           SelfPid;          /* PID của RansomWall.exe — whitelist */
-    BOOLEAN         CowPaused;        /* free disk < RESERVE -> fail-open   */
+    ULONG           SelfPid;
+    BOOLEAN         CowPaused;
 
     LARGE_INTEGER   RegCookie;
     BOOLEAN         RegCallbackOn;
@@ -42,8 +98,10 @@ typedef struct _RW_GLOBALS {
 
 RW_GLOBALS gRw = { 0 };
 
+static BOOLEAN PathContainsCI(PCUNICODE_STRING Path, PCWSTR Needle);   /* fwd decl */
+
 /* --------------------------------------------------------------------------
-   FirstTouchTable — hash table (PID, FileRef) -> đã chạm chưa
+   FirstTouchTable — hash table (PID, Key) -> đã chạm chưa
    -------------------------------------------------------------------------- */
 #define FT_BUCKETS 1024
 
@@ -58,12 +116,21 @@ KSPIN_LOCK  gFtLock;
 
 #define RW_TAG 'llWR'
 
+static LONGLONG PathHash64(PCUNICODE_STRING p) {
+    LONGLONG h = 1469598103934665603LL;
+    USHORT n = p->Length / sizeof(WCHAR);
+    for (USHORT i = 0; i < n; i++) {
+        h ^= (LONGLONG)RtlUpcaseUnicodeChar(p->Buffer[i]);
+        h *= 1099511628211LL;
+    }
+    return h;
+}
+
 static ULONG FtHash(ULONG Pid, LONGLONG FileRef) {
     ULONGLONG h = ((ULONGLONG)Pid * 2654435761ULL) ^ ((ULONGLONG)FileRef * 40503ULL);
     return (ULONG)(h % FT_BUCKETS);
 }
 
-/* Trả về TRUE nếu ĐÂY LÀ LẦN ĐẦU (và đã insert). FALSE nếu đã tồn tại. */
 static BOOLEAN FtTestAndSet(ULONG Pid, LONGLONG FileRef) {
     ULONG idx = FtHash(Pid, FileRef);
     KIRQL oldIrql;
@@ -71,9 +138,8 @@ static BOOLEAN FtTestAndSet(ULONG Pid, LONGLONG FileRef) {
     PFT_ENTRY entry;
     BOOLEAN isFirst = TRUE;
 
-    /* Cấp phát trước khi lấy spinlock — không được alloc ở DISPATCH_LEVEL */
     PFT_ENTRY fresh = (PFT_ENTRY)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(FT_ENTRY), RW_TAG);
-    if (fresh == NULL) return FALSE;   /* hết bộ nhớ -> coi như đã chạm, không pend */
+    if (fresh == NULL) return FALSE;
 
     KeAcquireSpinLock(&gFtLock, &oldIrql);
     for (e = gFtBucket[idx].Flink; e != &gFtBucket[idx]; e = e->Flink) {
@@ -121,16 +187,17 @@ static VOID FtFlushAll(VOID) {
     KeReleaseSpinLock(&gFtLock, oldIrql);
 }
 
-/* --------------------------------------------------------------------------
-   Process tree — Pid -> RootPid
-   -------------------------------------------------------------------------- */
+/* ==========================================================================
+   PROCESS TREE — Pid -> RootPid   ([FIX 8] shell là điểm dừng)
+   ========================================================================== */
 #define PT_BUCKETS 256
 
 typedef struct _PT_ENTRY {
     LIST_ENTRY Link;
     ULONG      Pid;
     ULONG      RootPid;
-    BOOLEAN    IsRwDescendant;   /* hậu duệ của RansomWall.exe (diec/floss/conhost) */
+    BOOLEAN    IsRwDescendant;
+    BOOLEAN    IsShell;
 } PT_ENTRY, * PPT_ENTRY;
 
 LIST_ENTRY gPtBucket[PT_BUCKETS];
@@ -150,13 +217,6 @@ static ULONG PtGetRoot(ULONG Pid) {
     return root;
 }
 
-/*
- * PtIsRwDescendant — tiến trình này do CHÍNH RansomWall sinh ra?
- *
- * Chặn đệ quy NGAY TẠI DRIVER, không tốn CreateToolhelp32Snapshot ở user-space
- * (snapshot duyệt toàn bộ process list, ~10-50ms mỗi lần — quá đắt để gọi
- * cho mỗi process create).
- */
 static BOOLEAN PtIsRwDescendant(ULONG Pid) {
     KIRQL oldIrql; BOOLEAN r = FALSE;
     KeAcquireSpinLock(&gPtLock, &oldIrql);
@@ -169,10 +229,49 @@ static BOOLEAN PtIsRwDescendant(ULONG Pid) {
     return r;
 }
 
-static VOID PtInsert(ULONG Pid, ULONG ParentPid) {
-    /* RootPid của con = RootPid của cha (nếu cha có), ngược lại chính cha */
-    ULONG   root = PtGetRoot(ParentPid);
-    /* Cờ hậu duệ lan xuống toàn bộ cây con của RansomWall */
+static BOOLEAN PtIsShell(ULONG Pid) {
+    KIRQL oldIrql; BOOLEAN r = FALSE;
+    KeAcquireSpinLock(&gPtLock, &oldIrql);
+    for (PLIST_ENTRY e = gPtBucket[PtHash(Pid)].Flink;
+        e != &gPtBucket[PtHash(Pid)]; e = e->Flink) {
+        PPT_ENTRY p = CONTAINING_RECORD(e, PT_ENTRY, Link);
+        if (p->Pid == Pid) { r = p->IsShell; break; }
+    }
+    KeReleaseSpinLock(&gPtLock, oldIrql);
+    return r;
+}
+
+static BOOLEAN IsShellImage(PCUNICODE_STRING Image) {
+    if (Image == NULL || Image->Length == 0) return FALSE;
+    return PathContainsCI(Image, L"\\EXPLORER.EXE") ||
+        PathContainsCI(Image, L"\\CMD.EXE") ||
+        PathContainsCI(Image, L"\\POWERSHELL.EXE") ||
+        PathContainsCI(Image, L"\\PWSH.EXE") ||
+        PathContainsCI(Image, L"\\SERVICES.EXE") ||
+        PathContainsCI(Image, L"\\SVCHOST.EXE") ||
+        PathContainsCI(Image, L"\\USERINIT.EXE") ||
+        PathContainsCI(Image, L"\\WINLOGON.EXE") ||
+        PathContainsCI(Image, L"\\TASKHOSTW.EXE") ||
+        PathContainsCI(Image, L"\\RUNTIMEBROKER.EXE") ||
+        PathContainsCI(Image, L"\\WERFAULT.EXE") ||
+        PathContainsCI(Image, L"\\CONHOST.EXE");
+}
+
+static VOID PtInsert(ULONG Pid, ULONG ParentPid, PCUNICODE_STRING Image) {
+    BOOLEAN meShell = IsShellImage(Image);
+
+    ULONG root;
+    if (ParentPid == 0) {
+        root = Pid;
+    }
+    else if (PtIsShell(ParentPid) && PtGetRoot(ParentPid) == ParentPid) {
+        root = Pid;                       /* chuỗi DỪNG ở shell */
+    }
+    else {
+        ULONG pr = PtGetRoot(ParentPid);
+        root = (pr == ParentPid) ? Pid : pr;
+    }
+
     BOOLEAN isRwDesc = (gRw.SelfPid != 0) &&
         (ParentPid == gRw.SelfPid || PtIsRwDescendant(ParentPid));
 
@@ -181,6 +280,7 @@ static VOID PtInsert(ULONG Pid, ULONG ParentPid) {
     fresh->Pid = Pid;
     fresh->RootPid = root;
     fresh->IsRwDescendant = isRwDesc;
+    fresh->IsShell = meShell;
 
     KIRQL oldIrql;
     KeAcquireSpinLock(&gPtLock, &oldIrql);
@@ -212,7 +312,7 @@ static VOID PtFlushAll(VOID) {
 }
 
 /* --------------------------------------------------------------------------
-   Denied PID list — sau khi ML kết luận MALWARE
+   Denied PID list
    -------------------------------------------------------------------------- */
 #define MAX_DENIED 64
 ULONG      gDenied[MAX_DENIED] = { 0 };
@@ -239,21 +339,9 @@ static VOID RemoveDenied(ULONG Pid) {
 }
 
 /* ==========================================================================
-   BỘ LỌC TRƯỚC KHI PEND — QUYẾT ĐỊNH HIỆU NĂNG CỦA CẢ HỆ THỐNG
-   ==========================================================================
-
-   LỖI ĐÃ SỬA (máy lag không dùng được):
-     Bản cũ pend MỌI first-touch, kể cả .tmp/.log/.etl/.dat trong C:\Windows.
-     Driver không biết VALUABLE_EXTS — danh sách đó nằm ở user-space.
-     Windows làm HÀNG NGHÌN first-touch mỗi giây khi chạy bình thường.
-     Mỗi cái tốn 2-5ms round-trip -> máy bò, không dùng nổi.
-
-   Quyết định PHẢI nằm trong kernel, TRƯỚC khi pend.
+   BỘ LỌC TRƯỚC KHI PEND
    ========================================================================== */
 
-static BOOLEAN PathContainsCI(PCUNICODE_STRING Path, PCWSTR Needle);   /* fwd decl */
-
-/* Thư mục KHÔNG quan tâm — ransomware không nhắm vào đây, mà I/O thì cực nhiều */
 static const PCWSTR gSkipDirs[] = {
     L"\\WINDOWS\\",
     L"\\PROGRAM FILES\\",
@@ -279,19 +367,51 @@ static BOOLEAN IsSkippedPath(PCUNICODE_STRING Path) {
     return FALSE;
 }
 
-/* Đuôi file CoW quan tâm — PHẢI khớp cfg::VALUABLE_EXTS ở user-space */
+/* PHẢI KHỚP cfg::VALUABLE_EXTS TRONG Config.h */
 static const PCWSTR gValuableExts[] = {
-    L".DOC",  L".DOCX", L".XLS",  L".XLSX", L".PPT",  L".PPTX",
-    L".PDF",  L".TXT",  L".RTF",  L".ODT",  L".CSV",  L".MD",
-    L".JPG",  L".JPEG", L".PNG",  L".GIF",  L".BMP",  L".PSD", L".RAW",
-    L".MP3",  L".MP4",  L".AVI",  L".MOV",  L".WAV",
-    L".ZIP",  L".RAR",  L".7Z",   L".TAR",  L".GZ",
-    L".SQL",  L".DB",   L".MDB",  L".ACCDB",L".JSON", L".XML",
+    L".DOC",  L".DOCX", L".DOCM", L".DOT",  L".DOTX", L".ODT",
+    L".XLS",  L".XLSX", L".XLSM", L".XLT",  L".XLTX", L".ODS",
+    L".PPT",  L".PPTX", L".PPTM", L".PPS",  L".PPSX", L".ODP",
+    L".PDF",  L".TXT",  L".RTF",  L".CSV",  L".MD",   L".TEX",
+    L".ONE",  L".PAGES",L".NUMBERS",
+
+    L".JPG",  L".JPEG", L".PNG",  L".GIF",  L".BMP",  L".PSD",
+    L".RAW",  L".TIF",  L".TIFF", L".WEBP", L".HEIC", L".SVG",
+    L".ICO",  L".AI",   L".EPS",  L".CR2",  L".NEF",  L".ARW", L".DNG",
+
+    L".MP3",  L".MP4",  L".AVI",  L".MOV",  L".WAV",  L".MKV",
+    L".FLAC", L".M4A",  L".WMV",  L".FLV",  L".WEBM", L".M4V",
+    L".AAC",  L".OGG",
+
+    L".ZIP",  L".RAR",  L".7Z",   L".TAR",  L".GZ",   L".BZ2",
+    L".XZ",   L".ISO",  L".CAB",
+
+    L".SQL",  L".DB",   L".MDB",  L".ACCDB", L".SQLITE", L".SQLITE3",
+    L".MDF",  L".LDF",  L".DBF",  L".FRM",  L".MYD",  L".BAK",
+
+    L".JSON", L".XML",  L".YAML", L".YML",  L".TOML", L".INI",
+    L".CFG",  L".CONF", L".ENV",  L".LOG",
+
     L".CPP",  L".H",    L".C",    L".HPP",  L".CS",   L".PY",
     L".JS",   L".TS",   L".JAVA", L".PHP",  L".HTML", L".CSS",
+    L".GO",   L".RS",   L".RB",   L".SH",   L".PL",   L".LUA",
+    L".SWIFT",L".KT",   L".VB",   L".ASM",  L".SLN",  L".VCXPROJ",
+
+    L".PEM",  L".KEY",  L".CRT",  L".PFX",  L".P12",  L".KDBX", L".OVPN",
+
+    L".PST",  L".OST",  L".EML",  L".MSG",  L".VCF",  L".ICS",
+
+    L".VSD",  L".DWG",  L".DXF",  L".SKP",  L".STL",  L".OBJ",
+    L".FBX",  L".BLEND",
+
+    L".VMDK", L".VDI",  L".VHD",  L".VHDX", L".OVA",
 };
 
-/* So đuôi file ở CUỐI đường dẫn (không phải substring bất kỳ) */
+static const PCWSTR gExecutableExts[] = {
+    L".EXE", L".DLL", L".SYS", L".BAT", L".CMD", L".PS1",
+    L".MSI", L".VBS", L".COM", L".SCR", L".HTA", L".PIF", L".CPL",
+};
+
 static BOOLEAN EndsWithCI(PCUNICODE_STRING Path, PCWSTR Suffix) {
     UNICODE_STRING s;
     RtlInitUnicodeString(&s, Suffix);
@@ -301,23 +421,27 @@ static BOOLEAN EndsWithCI(PCUNICODE_STRING Path, PCWSTR Suffix) {
     USHORT sChars = s.Length / sizeof(WCHAR);
     USHORT off = pChars - sChars;
 
-    for (USHORT i = 0; i < sChars; i++)
-        if (RtlUpcaseUnicodeChar(Path->Buffer[off + i]) !=
-            RtlUpcaseUnicodeChar(s.Buffer[i])) return FALSE;
+    for (USHORT i = sChars; i > 0; i--)
+        if (RtlUpcaseUnicodeChar(Path->Buffer[off + i - 1]) !=
+            RtlUpcaseUnicodeChar(s.Buffer[i - 1])) return FALSE;
     return TRUE;
 }
 
 static BOOLEAN IsValuableExt(PCUNICODE_STRING Path) {
+#if RW_COW_BLACKLIST_MODE
+    for (int i = 0; i < ARRAYSIZE(gExecutableExts); i++)
+        if (EndsWithCI(Path, gExecutableExts[i])) return FALSE;
+    return TRUE;
+#else
     for (int i = 0; i < ARRAYSIZE(gValuableExts); i++)
         if (EndsWithCI(Path, gValuableExts[i])) return TRUE;
     return FALSE;
+#endif
 }
 
 /* ==========================================================================
    PATH BLACKLIST (H1)
    ========================================================================== */
-
-   /* So khớp trên NORMALIZED name (\Device\HarddiskVolumeX\Windows\System32\...) */
 static const PCWSTR gBlacklist[] = {
     L"\\WINDOWS\\SYSTEM32\\",
     L"\\WINDOWS\\SYSWOW64\\",
@@ -354,14 +478,6 @@ static BOOLEAN IsBlacklisted(PCUNICODE_STRING Path) {
     return FALSE;
 }
 
-/*
- * Trusted process — CHỈ theo image path tuyệt đối.
- * KHÔNG whitelist theo token SYSTEM: ransomware sau privilege escalation
- * chạy dưới SYSTEM, whitelist theo quyền = tự mở cửa.
- *
- * GHI CHÚ: bản đầy đủ phải verify chữ ký số (làm ở user-space lúc khởi động,
- * cache theo image hash). Ở đây kiểm path là mức tối thiểu.
- */
 static const PCWSTR gTrustedImages[] = {
     L"\\WINDOWS\\SERVICING\\TRUSTEDINSTALLER.EXE",
     L"\\WINDOWS\\SYSTEM32\\WUAUCLT.EXE",
@@ -386,15 +502,6 @@ static BOOLEAN IsTrustedProcess(VOID) {
 /* ==========================================================================
    GỬI EVENT LÊN USER-SPACE
    ========================================================================== */
-
-   /*
-    * SendEvent — gửi event lên user-space.
-    *
-    * WaitReply = TRUE  -> chờ CMD_CONTINUE (dùng cho pend / CoW backup)
-    * WaitReply = FALSE -> gửi rồi quên (dùng cho event tính điểm)
-    *
-    * BẮT BUỘC PASSIVE_LEVEL. Gọi ở IRQL cao hơn = crash.
-    */
 static NTSTATUS SendEvent(PRW_EVENT Ev, BOOLEAN WaitReply, PULONG ReplyCode) {
     if (gRw.ClientPort == NULL) return STATUS_PORT_DISCONNECTED;
     if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
@@ -411,10 +518,7 @@ static NTSTATUS SendEvent(PRW_EVENT Ev, BOOLEAN WaitReply, PULONG ReplyCode) {
     NTSTATUS st = FltSendMessage(gRw.Filter, &gRw.ClientPort, Ev, sizeof(RW_EVENT),
         &reply, &replyLen, &timeout);
 
-    /*
-     * FAIL-OPEN. Nếu user-space treo/chết, KHÔNG BAO GIỜ để máy người dùng đứng.
-     * Mất một file còn hơn treo cả hệ thống.
-     */
+    /* FAIL-OPEN: user-space treo/chết thì KHÔNG để máy đứng. */
     if (st == STATUS_TIMEOUT || !NT_SUCCESS(st)) {
         if (ReplyCode) *ReplyCode = RwReplyContinue;
         return STATUS_TIMEOUT;
@@ -423,7 +527,6 @@ static NTSTATUS SendEvent(PRW_EVENT Ev, BOOLEAN WaitReply, PULONG ReplyCode) {
     return STATUS_SUCCESS;
 }
 
-/* Điền FilePath + FileRef vào event. Trả về FALSE nếu không lấy được tên. */
 static BOOLEAN FillFileInfo(PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects,
     PRW_EVENT Ev, PUNICODE_STRING* OutName, PFLT_FILE_NAME_INFORMATION* OutInfo)
 {
@@ -438,7 +541,6 @@ static BOOLEAN FillFileInfo(PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltOb
     RtlZeroMemory(Ev->FilePath, sizeof(Ev->FilePath));
     RtlCopyMemory(Ev->FilePath, nameInfo->Name.Buffer, copyLen);
 
-    /* FileRef — bất biến khi rename, chống lách bằng đổi tên rồi ghi */
     FILE_INTERNAL_INFORMATION fi = { 0 };
     ULONG ret = 0;
     if (NT_SUCCESS(FltQueryInformationFile(FltObjects->Instance, FltObjects->FileObject,
@@ -461,21 +563,12 @@ static FLT_PREOP_CALLBACK_STATUS HandleMutation(
 {
     ULONG pid = (ULONG)(ULONG_PTR)PsGetCurrentProcessId();
 
-    /* Bỏ qua chính mình — nếu không sẽ deadlock khi CoW ghi vào backup store */
     if (pid == gRw.SelfPid) return FLT_PREOP_SUCCESS_NO_CALLBACK;
-
-    /*
-     * Bỏ qua hậu duệ của RansomWall (diec.exe, floss.exe, conhost.exe của chúng).
-     * Không có cái này thì phân tích tĩnh tự kích hoạt chính nó -> đệ quy vô hạn.
-     */
     if (PtIsRwDescendant(pid)) return FLT_PREOP_SUCCESS_NO_CALLBACK;
-
-    /* Bỏ qua kernel-mode và paging I/O — pend paging I/O = deadlock memory manager */
     if (Data->RequestorMode == KernelMode) return FLT_PREOP_SUCCESS_NO_CALLBACK;
     if (FlagOn(Data->Iopb->IrpFlags, IRP_PAGING_IO | IRP_SYNCHRONOUS_PAGING_IO))
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
-    /* PID đã bị ML kết luận MALWARE -> deny thẳng, không hỏi ai */
     if (IsDenied(pid)) {
         Data->IoStatus.Status = STATUS_ACCESS_DENIED;
         Data->IoStatus.Information = 0;
@@ -489,7 +582,6 @@ static FLT_PREOP_CALLBACK_STATUS HandleMutation(
     if (!FillFileInfo(Data, FltObjects, &ev, &name, &nameInfo))
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
-    /* ---- 1.1 PATH BLACKLIST — deny ngay, không hỏi user-space ---- */
     if (IsBlacklisted(name)) {
         BOOLEAN trusted = IsTrustedProcess();
         FltReleaseFileNameInformation(nameInfo);
@@ -501,38 +593,28 @@ static FLT_PREOP_CALLBACK_STATUS HandleMutation(
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
-    /*
-     * ---- BỘ LỌC HIỆU NĂNG — PHẢI đứng TRƯỚC mọi FltSendMessage ----
-     *
-     * Không có khối này, máy KHÔNG DÙNG ĐƯỢC: Windows làm hàng nghìn
-     * first-touch mỗi giây vào .tmp/.log/.etl trong C:\Windows, mỗi cái
-     * tốn 2-5ms round-trip lên user-space.
-     */
-    BOOLEAN skipDir = IsSkippedPath(name);
-    BOOLEAN valuable = IsValuableExt(name);
-
-    if (skipDir) {
-        /* C:\Windows, Temp, Recycle Bin... — không backup, không tính điểm */
+    if (IsSkippedPath(name)) {
         FltReleaseFileNameInformation(nameInfo);
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
+
+    BOOLEAN valuable = IsValuableExt(name);
+    LONGLONG ftKey = PathHash64(name);
     FltReleaseFileNameInformation(nameInfo);
 
     ev.Pid = pid;
     ev.RootPid = PtGetRoot(pid);
     ev.Action = Action;
+    ev.FileRef = ftKey;
 
-    /* ---- 1.2 FIRST TOUCH -> pend cho CoW backup ----
-       CHỈ pend khi đuôi file nằm trong danh sách CoW quan tâm.
-       Đuôi khác -> chỉ gửi event tính điểm, không chặn. */
-    BOOLEAN isFirst = valuable && (!gRw.CowPaused) && FtTestAndSet(pid, ev.FileRef);
+    BOOLEAN isFirst = valuable && (!gRw.CowPaused) && FtTestAndSet(pid, ftKey);
 
     if (isFirst && KeGetCurrentIrql() == PASSIVE_LEVEL) {
         ev.IsPending = 1;
         ev.IsFirstTouch = 1;
 
         ULONG replyCode = RwReplyContinue;
-        SendEvent(&ev, TRUE, &replyCode);   /* CHỜ user-space copy xong (~2-5ms) */
+        SendEvent(&ev, TRUE, &replyCode);
 
         if (replyCode == RwReplyDeny) {
             Data->IoStatus.Status = STATUS_ACCESS_DENIED;
@@ -542,7 +624,6 @@ static FLT_PREOP_CALLBACK_STATUS HandleMutation(
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
-    /* Lần thứ 2 trở đi (hoặc đuôi không valuable): event tính điểm, cho qua ngay */
     ev.IsPending = 0;
     ev.IsFirstTouch = 0;
     if (KeGetCurrentIrql() == PASSIVE_LEVEL)
@@ -552,8 +633,146 @@ static FLT_PREOP_CALLBACK_STATUS HandleMutation(
 }
 
 /* ==========================================================================
-   PRE-OPERATION CALLBACKS
+   PRE-CREATE
+   ==========================================================================
+   Hai đường:
+     A. MỞ GHI / phá huỷ  -> PEND, chờ user-space backup (như cũ)
+     B. MỞ ĐỌC  [FIX 11]  -> gửi event KHÔNG PEND, chỉ để bắt honey + đếm I/O
+
+   Đường B là thứ bắt được Chaos: nó đọc file gốc rồi ghi ra file mới, nên
+   đường A không bao giờ thấy gì.
    ========================================================================== */
+FLT_PREOP_CALLBACK_STATUS PreCreate(
+    _Inout_ PFLT_CALLBACK_DATA Data, _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _Flt_CompletionContext_Outptr_ PVOID* CompletionContext)
+{
+    UNREFERENCED_PARAMETER(FltObjects);
+    UNREFERENCED_PARAMETER(CompletionContext);
+
+    ULONG pid = (ULONG)(ULONG_PTR)PsGetCurrentProcessId();
+    if (pid == gRw.SelfPid)                    return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (PtIsRwDescendant(pid))                 return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (Data->RequestorMode == KernelMode)     return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL)   return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (IsDenied(pid)) {
+        Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+        Data->IoStatus.Information = 0;
+        return FLT_PREOP_COMPLETE;
+    }
+
+    ULONG opts = Data->Iopb->Parameters.Create.Options;
+    ULONG disp = (opts >> 24) & 0xFF;
+
+    BOOLEAN destructive =
+        (disp == FILE_SUPERSEDE || disp == FILE_OVERWRITE || disp == FILE_OVERWRITE_IF);
+    BOOLEAN delOnClose = FlagOn(opts, FILE_DELETE_ON_CLOSE) ? TRUE : FALSE;
+
+    ACCESS_MASK acc = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+    BOOLEAN wantsWrite = FlagOn(acc,
+        FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | GENERIC_WRITE | GENERIC_ALL)
+        ? TRUE : FALSE;
+
+    /* [FIX 11] Mở ĐỌC — Chaos dùng đường này để lấy nội dung gốc */
+    BOOLEAN wantsRead = FlagOn(acc, FILE_READ_DATA | GENERIC_READ) ? TRUE : FALSE;
+
+    BOOLEAN writePath = (destructive || delOnClose || wantsWrite);
+
+#if RW_TRACK_READ_OPEN
+    if (!writePath && !wantsRead) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+#else
+    if (!writePath) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+#endif
+
+    /* File mới toanh — không có gì để cứu, cũng không có gì để bẫy */
+    if (disp == FILE_CREATE) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+
+    /* Đường GHI cần CoW đang bật; đường ĐỌC thì không (chỉ tính điểm) */
+    if (writePath && gRw.CowPaused) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+
+    /* Pre-create PHẢI dùng FLT_FILE_NAME_OPENED (NORMALIZED chưa sẵn sàng) */
+    PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
+    if (!NT_SUCCESS(FltGetFileNameInformation(Data,
+        FLT_FILE_NAME_OPENED | FLT_FILE_NAME_QUERY_DEFAULT, &nameInfo)))
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    FltParseFileNameInformation(nameInfo);
+
+    if (IsBlacklisted(&nameInfo->Name) ||
+        IsSkippedPath(&nameInfo->Name) ||
+        !IsValuableExt(&nameInfo->Name)) {
+        FltReleaseFileNameInformation(nameInfo);
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    LONGLONG key = PathHash64(&nameInfo->Name);
+
+    /* ==================================================================
+       ĐƯỜNG B — MỞ ĐỌC. KHÔNG PEND, KHÔNG CHẶN IRP.
+       ================================================================== */
+#if RW_TRACK_READ_OPEN
+    if (!writePath) {
+        /* Key riêng để không ăn mất slot pend của thao tác GHI sau này */
+        BOOLEAN firstRead = FtTestAndSet(pid, key ^ RW_READ_MARK);
+        if (!firstRead) {
+            FltReleaseFileNameInformation(nameInfo);
+            return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        }
+
+        RW_EVENT rev = { 0 };
+        rev.Pid = pid;
+        rev.RootPid = PtGetRoot(pid);
+        rev.Action = RwActionRead;
+        rev.IsPending = 0;          /* <<< KHÔNG CHỜ. IRP đi tiếp ngay. */
+        rev.IsFirstTouch = 1;
+        rev.FileRef = key;
+        rev.DirEntryCount = disp;
+
+        ULONG rlen = min(nameInfo->Name.Length, (RW_MAX_PATH - 1) * sizeof(WCHAR));
+        RtlCopyMemory(rev.FilePath, nameInfo->Name.Buffer, rlen);
+        FltReleaseFileNameInformation(nameInfo);
+
+        SendEvent(&rev, FALSE, NULL);
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+#endif
+
+    /* ==================================================================
+       ĐƯỜNG A — MỞ GHI / PHÁ HUỶ. PEND, chờ user-space backup.
+       ================================================================== */
+    BOOLEAN isFirst = FtTestAndSet(pid, key);
+
+#ifdef RW_VERBOSE_TRACE
+    DbgPrint("[RW-KEY] pid=%lu disp=%lu first=%d key=%lld path=%wZ\n",
+        pid, disp, isFirst, key, &nameInfo->Name);
+#endif
+
+    if (!isFirst) {
+        FltReleaseFileNameInformation(nameInfo);
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    RW_EVENT ev = { 0 };
+    ev.Pid = pid;
+    ev.RootPid = PtGetRoot(pid);
+    ev.Action = RwActionWrite;
+    ev.IsPending = 1;
+    ev.IsFirstTouch = 1;
+    ev.FileRef = key;
+    ev.DirEntryCount = disp;
+
+    ULONG copyLen = min(nameInfo->Name.Length, (RW_MAX_PATH - 1) * sizeof(WCHAR));
+    RtlCopyMemory(ev.FilePath, nameInfo->Name.Buffer, copyLen);
+    FltReleaseFileNameInformation(nameInfo);
+
+    ULONG replyCode = RwReplyContinue;
+    SendEvent(&ev, TRUE, &replyCode);
+
+    if (replyCode == RwReplyDeny) {
+        Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+        Data->IoStatus.Information = 0;
+        return FLT_PREOP_COMPLETE;
+    }
+    return FLT_PREOP_SUCCESS_NO_CALLBACK;
+}
 
 FLT_PREOP_CALLBACK_STATUS PreWrite(
     _Inout_ PFLT_CALLBACK_DATA Data, _In_ PCFLT_RELATED_OBJECTS FltObjects,
@@ -579,7 +798,7 @@ FLT_PREOP_CALLBACK_STATUS PreSetInformation(
     case FileDispositionInformation:
     case FileDispositionInformationEx:
         action = RwActionDelete; break;
-    case FileEndOfFileInformation:      /* truncate = phá dữ liệu */
+    case FileEndOfFileInformation:
     case FileAllocationInformation:
         action = RwActionWrite;  break;
     default:
@@ -588,10 +807,7 @@ FLT_PREOP_CALLBACK_STATUS PreSetInformation(
     return HandleMutation(Data, FltObjects, action);
 }
 
-/*
- * PostDirectoryControl — nguồn dữ liệu THẬT cho F9.
- * v3.0 đếm event file bất kỳ rồi gọi nó là "directory enumeration" — sai.
- */
+/* PostDirectoryControl — nguồn dữ liệu THẬT cho F9 */
 FLT_POSTOP_CALLBACK_STATUS PostDirectoryControl(
     _Inout_ PFLT_CALLBACK_DATA Data, _In_ PCFLT_RELATED_OBJECTS FltObjects,
     _In_opt_ PVOID CompletionContext, _In_ FLT_POST_OPERATION_FLAGS Flags)
@@ -607,7 +823,6 @@ FLT_POSTOP_CALLBACK_STATUS PostDirectoryControl(
     if (pid == gRw.SelfPid) return FLT_POSTOP_FINISHED_PROCESSING;
     if (PtIsRwDescendant(pid)) return FLT_POSTOP_FINISHED_PROCESSING;
 
-    /* Đếm số entry trả về */
     ULONG count = 0;
     PVOID buf = Data->Iopb->Parameters.DirectoryControl.QueryDirectory.DirectoryBuffer;
     FILE_INFORMATION_CLASS cls =
@@ -639,7 +854,6 @@ FLT_POSTOP_CALLBACK_STATUS PostDirectoryControl(
     PUNICODE_STRING name = NULL;
     PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
     if (FillFileInfo(Data, FltObjects, &ev, &name, &nameInfo)) {
-        /* Bỏ qua liệt kê thư mục hệ thống — indexer/AV quét liên tục, cực nhiều */
         BOOLEAN skip = IsSkippedPath(name);
         FltReleaseFileNameInformation(nameInfo);
         if (skip) return FLT_POSTOP_FINISHED_PROCESSING;
@@ -652,7 +866,6 @@ FLT_POSTOP_CALLBACK_STATUS PostDirectoryControl(
 /* ==========================================================================
    PROCESS NOTIFY — RootPid + command line (F6, F7)
    ========================================================================== */
-
 VOID ProcessNotify(
     _Inout_ PEPROCESS Process, _In_ HANDLE ProcessId,
     _Inout_opt_ PPS_CREATE_NOTIFY_INFO CreateInfo)
@@ -661,7 +874,6 @@ VOID ProcessNotify(
     ULONG pid = (ULONG)(ULONG_PTR)ProcessId;
 
     if (CreateInfo == NULL) {
-        /* ---- Tiến trình THOÁT ---- */
         FtRemovePid(pid);
         RemoveDenied(pid);
 
@@ -675,15 +887,9 @@ VOID ProcessNotify(
         return;
     }
 
-    /* ---- Tiến trình TẠO MỚI ---- */
     ULONG parent = (ULONG)(ULONG_PTR)CreateInfo->ParentProcessId;
-    PtInsert(pid, parent);
+    PtInsert(pid, parent, CreateInfo->ImageFileName);
 
-    /*
-     * Không báo lên user-space nếu đây là con của chính RansomWall
-     * (diec.exe, floss.exe, conhost.exe của chúng).
-     * Không có guard này -> phân tích tĩnh tự kích hoạt chính nó -> đệ quy vô hạn.
-     */
     if (PtIsRwDescendant(pid)) return;
 
     RW_EVENT ev = { 0 };
@@ -695,11 +901,6 @@ VOID ProcessNotify(
         ULONG len = min(CreateInfo->ImageFileName->Length, (RW_MAX_PATH - 1) * sizeof(WCHAR));
         RtlCopyMemory(ev.FilePath, CreateInfo->ImageFileName->Buffer, len);
     }
-    /*
-     * Command line — đây là nguồn dữ liệu THẬT cho F6 và F7.
-     * v3.0 tìm chuỗi "bcdedit"/"vssadmin" trong FILE — pack là mất.
-     * Ở đây ta bắt được lệnh thật lúc chạy.
-     */
     if (CreateInfo->CommandLine) {
         ULONG len = min(CreateInfo->CommandLine->Length, (RW_MAX_CMDLINE - 1) * sizeof(WCHAR));
         RtlCopyMemory(ev.CommandLine, CreateInfo->CommandLine->Buffer, len);
@@ -709,39 +910,23 @@ VOID ProcessNotify(
 }
 
 /* ==========================================================================
-   REGISTRY CALLBACK — nguồn dữ liệu THẬT cho F8
+   REGISTRY CALLBACK — F8
    ========================================================================== */
-
-   /*
-    * IsPersistenceKey — F8.
-    *
-    * LỖI ĐÃ SỬA: điều kiện cũ là PathContainsCI(Key, L"\\CONTROLSET001\\SERVICES")
-    * -> khớp \REGISTRY\MACHINE\SYSTEM\ControlSet001\Services\bam\State\UserSettings\...
-    *
-    * BAM (Background Activity Moderator) được Windows ghi MỖI LẦN bất kỳ .exe nào
-    * chạy. Kết quả: F8 bật cho 100% tiến trình -> vô dụng, nhiễu log kinh khủng.
-    *
-    * Sửa: loại BAM/DAM trước, và với Services chỉ bắt ImagePath/Start
-    * (tạo service mới hoặc hijack service) — không bắt mọi value.
-    */
 static BOOLEAN IsPersistenceKey(PCUNICODE_STRING Key, PCUNICODE_STRING ValueName) {
 
-    /* ---- LOẠI TRỪ: Windows tự ghi cho mọi tiến trình ---- */
-    if (PathContainsCI(Key, L"\\SERVICES\\BAM\\"))      return FALSE;  /* thủ phạm chính */
+    if (PathContainsCI(Key, L"\\SERVICES\\BAM\\"))      return FALSE;
     if (PathContainsCI(Key, L"\\SERVICES\\DAM\\"))      return FALSE;
     if (PathContainsCI(Key, L"\\SERVICES\\TCPIP\\"))    return FALSE;
     if (PathContainsCI(Key, L"\\SERVICES\\EVENTLOG\\")) return FALSE;
     if (PathContainsCI(Key, L"\\STATE\\USERSETTINGS"))  return FALSE;
     if (PathContainsCI(Key, L"\\SERVICES\\WINSOCK"))    return FALSE;
 
-    /* ---- Run / RunOnce: hiếm, giữ nguyên ---- */
     if (PathContainsCI(Key, L"\\CURRENTVERSION\\RUN") ||
         PathContainsCI(Key, L"\\CURRENTVERSION\\RUNONCE") ||
         PathContainsCI(Key, L"\\CURRENTVERSION\\RUNSERVICES") ||
         PathContainsCI(Key, L"\\CURRENTVERSION\\WINLOGON"))
         return TRUE;
 
-    /* ---- Services: CHỈ khi ghi ImagePath/Start (tạo hoặc hijack) ---- */
     if (PathContainsCI(Key, L"\\CONTROLSET001\\SERVICES\\") ||
         PathContainsCI(Key, L"\\CURRENTCONTROLSET\\SERVICES\\")) {
         if (ValueName == NULL || ValueName->Length == 0) return FALSE;
@@ -789,7 +974,6 @@ NTSTATUS RegistryCallback(_In_ PVOID CallbackContext, _In_opt_ PVOID Argument1,
 /* ==========================================================================
    COMMUNICATION PORT
    ========================================================================== */
-
 NTSTATUS PortConnect(_In_ PFLT_PORT ClientPort, _In_opt_ PVOID ServerPortCookie,
     _In_reads_bytes_opt_(SizeOfContext) PVOID ConnectionContext,
     _In_ ULONG SizeOfContext, _Outptr_result_maybenull_ PVOID* ConnectionCookie)
@@ -804,11 +988,6 @@ NTSTATUS PortConnect(_In_ PFLT_PORT ClientPort, _In_opt_ PVOID ServerPortCookie,
 
 VOID PortDisconnect(_In_opt_ PVOID ConnectionCookie) {
     UNREFERENCED_PARAMETER(ConnectionCookie);
-    /*
-     * User-space ngắt kết nối (thoát hoặc BỊ KILL).
-     * Fail-open: xoá FirstTouchTable để không pend nữa — nếu không,
-     * mọi IRP sẽ timeout 200ms và máy sẽ bò.
-     */
     FltCloseClientPort(gRw.Filter, &gRw.ClientPort);
     gRw.ClientPort = NULL;
     gRw.SelfPid = 0;
@@ -847,7 +1026,6 @@ NTSTATUS PortMessage(_In_opt_ PVOID PortCookie,
 /* ==========================================================================
    FILTER REGISTRATION
    ========================================================================== */
-
 NTSTATUS InstanceSetup(_In_ PCFLT_RELATED_OBJECTS FltObjects,
     _In_ FLT_INSTANCE_SETUP_FLAGS Flags,
     _In_ DEVICE_TYPE VolumeDeviceType,
@@ -856,7 +1034,6 @@ NTSTATUS InstanceSetup(_In_ PCFLT_RELATED_OBJECTS FltObjects,
     UNREFERENCED_PARAMETER(FltObjects);
     UNREFERENCED_PARAMETER(Flags);
     UNREFERENCED_PARAMETER(VolumeFilesystemType);
-    /* Chỉ gắn vào ổ đĩa, không gắn vào network/cdrom */
     if (VolumeDeviceType != FILE_DEVICE_DISK_FILE_SYSTEM) return STATUS_FLT_DO_NOT_ATTACH;
     return STATUS_SUCCESS;
 }
@@ -878,6 +1055,7 @@ NTSTATUS FilterUnload(_In_ FLT_FILTER_UNLOAD_FLAGS Flags) {
 }
 
 CONST FLT_OPERATION_REGISTRATION Callbacks[] = {
+    { IRP_MJ_CREATE,            0, PreCreate,          NULL },
     { IRP_MJ_WRITE,             0, PreWrite,           NULL },
     { IRP_MJ_SET_INFORMATION,   0, PreSetInformation,  NULL },
     { IRP_MJ_DIRECTORY_CONTROL, 0, NULL,               PostDirectoryControl },
@@ -904,7 +1082,6 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
     st = FltRegisterFilter(DriverObject, &FilterRegistration, &gRw.Filter);
     if (!NT_SUCCESS(st)) return st;
 
-    /* --- Communication port --- */
     UNICODE_STRING portName;
     RtlInitUnicodeString(&portName, RW_PORT_NAME);
 
@@ -922,12 +1099,9 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
     FltFreeSecurityDescriptor(sd);
     if (!NT_SUCCESS(st)) { FltUnregisterFilter(gRw.Filter); return st; }
 
-    /* --- Process notify (F6, F7, RootPid) --- */
     st = PsSetCreateProcessNotifyRoutineEx(ProcessNotify, FALSE);
     if (NT_SUCCESS(st)) gRw.ProcessNotifyOn = TRUE;
-    /* Lỗi thường gặp: STATUS_ACCESS_DENIED nếu thiếu /INTEGRITYCHECK khi link */
 
-    /* --- Registry callback (F8) --- */
     UNICODE_STRING altitude;
     RtlInitUnicodeString(&altitude, L"370010");
     st = CmRegisterCallbackEx(RegistryCallback, &altitude, DriverObject,

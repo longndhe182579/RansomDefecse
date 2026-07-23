@@ -137,6 +137,10 @@ namespace rw {
             return true;
         }
 
+        /* [FIX 18] Cho StatusThread doc — phan biet loi that voi reply muon */
+        uint64_t ReplyFailCount()  const { return replyFails_.load(); }
+        uint64_t LateReplyCount()  const { return lateReplies_.load(); }
+
     private:
         struct PendingMsg {
             OVERLAPPED   Ovlp;
@@ -149,6 +153,9 @@ namespace rw {
         std::atomic<bool> running_{ false };
         std::atomic<bool> connected_{ false };
         std::atomic<uint64_t> replyFails_{ 0 };
+        /* [FIX 18] Đếm riêng reply đến muộn (0x801F0020) — vô hại, không
+           trộn chung với lỗi thật để khỏi che mất tín hiệu nghiêm trọng. */
+        std::atomic<uint64_t> lateReplies_{ 0 };
         Handler  handler_;
 
         void PostReceive(PendingMsg* pm) {
@@ -207,19 +214,46 @@ namespace rw {
                     HRESULT hr = FilterReplyMessage(port_, &reply.Header, kReplySize);
 
                     if (FAILED(hr)) {
-                        /* Chỉ log 1 lần mỗi 100 lỗi — nếu không sẽ ngập console */
-                        if (replyFails_.fetch_add(1) % 100 == 0) {
-                            LOG_E("FilterReplyMessage that bai: 0x%08X (da fail %llu lan)",
-                                hr, replyFails_.load());
-                            if (hr == HRESULT_FROM_WIN32(ERROR_MORE_DATA))
-                                LOG_E("  -> ERROR_MORE_DATA: kich thuoc reply KHONG khop. "
-                                    "User gui %lu byte payload, driver khai sizeof(RW_REPLY)=%zu.",
-                                    kReplySize - (DWORD)sizeof(FILTER_REPLY_HEADER),
-                                    sizeof(RW_REPLY));
-                            else if (hr == HRESULT_FROM_WIN32(ERROR_INVALID_PARAMETER))
-                                LOG_E("  -> MessageId sai hoac IRP da bi huy.");
-                            LOG_E("  -> CoW KHONG HOAT DONG: driver timeout 200ms roi fail-open. "
-                                "Khong file nao duoc backup.");
+                        /* =====================================================
+                           [FIX 18] 0x801F0020 KHÔNG PHẢI LỖI NGHIÊM TRỌNG
+                           =====================================================
+                           ERROR_FLT_NO_WAITER_FOR_REPLY = ta trả lời NHƯNG driver
+                           đã hết chờ 200ms và fail-open cho IRP đi tiếp.
+
+                           Lưu ý: hằng số này ĐÃ là HRESULT sẵn trong winerror.h
+                           (_HRESULT_TYPEDEF_(0x801F0020L)) -> so sánh TRỰC TIẾP,
+                           KHÔNG bọc HRESULT_FROM_WIN32.
+
+                           Bản cũ in "CoW KHONG HOAT DONG ... Khong file nao duoc
+                           backup" cho MỌI lỗi vì dòng đó nằm NGOÀI chuỗi if/else.
+                           Sai ngữ cảnh và gây hoảng: trong log Akira, lỗi này chỉ
+                           xảy ra 1 lần, đúng lúc copy file lớn song song với thao
+                           tác kill — file đó VẪN backup xong bình thường.
+
+                           Đếm riêng, log ở mức WARN, không tính vào replyFails_.
+                           ===================================================== */
+                        if (hr == ERROR_FLT_NO_WAITER_FOR_REPLY) {
+                            if (lateReplies_.fetch_add(1) % 50 == 0) {
+                                LOG_W("[FLT] Reply den muon — driver da timeout 200ms cho IRP nay "
+                                    "(tong %llu lan). File van co the da backup xong; "
+                                    "chi la ta tra loi cham.", lateReplies_.load());
+                            }
+                        }
+                        else {
+                            /* Chỉ log 1 lần mỗi 100 lỗi — nếu không sẽ ngập console */
+                            if (replyFails_.fetch_add(1) % 100 == 0) {
+                                LOG_E("FilterReplyMessage that bai: 0x%08X (da fail %llu lan)",
+                                    hr, replyFails_.load());
+                                if (hr == HRESULT_FROM_WIN32(ERROR_MORE_DATA))
+                                    LOG_E("  -> ERROR_MORE_DATA: kich thuoc reply KHONG khop. "
+                                        "User gui %lu byte payload, driver khai sizeof(RW_REPLY)=%zu.",
+                                        kReplySize - (DWORD)sizeof(FILTER_REPLY_HEADER),
+                                        sizeof(RW_REPLY));
+                                else if (hr == HRESULT_FROM_WIN32(ERROR_INVALID_PARAMETER))
+                                    LOG_E("  -> MessageId sai hoac IRP da bi huy.");
+                                LOG_E("  -> CoW KHONG HOAT DONG: driver timeout 200ms roi fail-open. "
+                                    "Khong file nao duoc backup.");
+                            }
                         }
                     }
                 }

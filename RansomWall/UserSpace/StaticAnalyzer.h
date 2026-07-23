@@ -22,9 +22,11 @@
 #include <wintrust.h>
 #include <softpub.h>
 #include <mscat.h>
+#include <bcrypt.h>      /* [FIX 13] BCRYPT_SHA256_ALGORITHM */
 
 #pragma comment(lib, "wintrust.lib")
 #pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "bcrypt.lib")
 
 namespace rw {
 
@@ -72,87 +74,168 @@ namespace rw {
         return r == ERROR_SUCCESS;
     }
 
+    /* ======================================================================
+       [FIX 13] CATALOG DÙNG SHA-256 TỪ WINDOWS 10 — BẢN CŨ TÍNH SHA-1
+       ======================================================================
+       Bản cũ gọi:
+           CryptCATAdminAcquireContext(&hCatAdmin, &action, 0)
+           CryptCATAdminCalcHashFromFileHandle(hFile, &hashLen, ...)
+
+       CẢ HAI HÀM NÀY MẶC ĐỊNH BĂM SHA-1.
+
+       Nhưng catalog trong C:\Windows\System32\CatRoot trên Windows 10/11 được
+       ký bằng SHA-256. Hash SHA-1 tính ra KHÔNG KHỚP entry nào ->
+       CryptCATAdminEnumCatalogFromHash trả NULL -> hàm trả false.
+
+       Hệ quả đo được trong log thực tế: cmd.exe, conhost.exe, powercfg.exe,
+       vssadmin.exe, VSSVC.exe, wbadmin.exe... ĐỀU báo "khong co chu ky hop le".
+       -> F1 bật cho ~100% tiến trình, mất hết giá trị phân biệt
+       -> ShouldAnalyzeStatically không lọc được gì -> DIE chạy trên MỌI binary
+          Windows -> bão quét tĩnh (30+ dòng "Cache MISS: conhost.exe" mỗi lần)
+
+       SỬA: dùng API thế hệ 2 (có từ Windows 8):
+           CryptCATAdminAcquireContext2(..., BCRYPT_SHA256_ALGORITHM, ...)
+           CryptCATAdminCalcHashFromFileHandle2(hCatAdmin, ...)
+
+       Vẫn giữ đường lui SHA-1 cho Windows 7 hoặc catalog cũ.
+
+       LƯU Ý VỀ THUẬT NGỮ (cho báo cáo):
+         Động cơ xác minh trong CẢ HAI đường vẫn là WinVerifyTrust.
+         Nhóm CryptCATAdmin* KHÔNG xác minh gì — chúng chỉ (1) tính hash file
+         và (2) tra xem hash nằm trong file .cat nào. Có đường dẫn .cat rồi
+         mới gọi WinVerifyTrust với WTD_CHOICE_CATALOG.
+       ====================================================================== */
+
+       /* Xác minh một file dựa trên catalog đã định vị được */
+    inline bool VerifyAgainstCatalog(HCATADMIN hCatAdmin, HCATINFO hCatInfo,
+        HANDLE hFile, const std::wstring& path,
+        std::vector<BYTE>& hash) {
+        CATALOG_INFO ci{};
+        ci.cbStruct = sizeof(ci);
+        if (!CryptCATCatalogInfoFromContext(hCatInfo, &ci, 0)) return false;
+
+        /* Member tag = hash dạng hex CHỮ HOA */
+        std::wstring tag;
+        static const wchar_t* k = L"0123456789ABCDEF";
+        tag.reserve(hash.size() * 2);
+        for (size_t i = 0; i < hash.size(); i++) {
+            tag += k[hash[i] >> 4];
+            tag += k[hash[i] & 0x0F];
+        }
+
+        WINTRUST_CATALOG_INFO wtc{};
+        wtc.cbStruct = sizeof(wtc);
+        wtc.pcwszCatalogFilePath = ci.wszCatalogFile;
+        wtc.pcwszMemberTag = tag.c_str();
+        wtc.pcwszMemberFilePath = path.c_str();
+        wtc.hMemberFile = hFile;
+        wtc.pbCalculatedFileHash = hash.data();
+        wtc.cbCalculatedFileHash = (DWORD)hash.size();
+        wtc.hCatAdmin = hCatAdmin;
+
+        WINTRUST_DATA wd{};
+        wd.cbStruct = sizeof(wd);
+        wd.dwUIChoice = WTD_UI_NONE;
+        wd.fdwRevocationChecks = WTD_REVOKE_NONE;
+        wd.dwUnionChoice = WTD_CHOICE_CATALOG;
+        wd.dwStateAction = WTD_STATEACTION_VERIFY;
+        wd.dwProvFlags = WTD_REVOCATION_CHECK_NONE | WTD_CACHE_ONLY_URL_RETRIEVAL;
+        wd.pCatalog = &wtc;
+
+        GUID g = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+        LONG r = WinVerifyTrust(nullptr, &g, &wd);      /* <<< XÁC MINH THẬT Ở ĐÂY */
+        wd.dwStateAction = WTD_STATEACTION_CLOSE;
+        WinVerifyTrust(nullptr, &g, &wd);
+        return r == ERROR_SUCCESS;
+    }
+
     inline bool VerifyCatalogSignature(const std::wstring& path) {
         HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
             nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (hFile == INVALID_HANDLE_VALUE) return false;
 
-        HCATADMIN hCatAdmin = nullptr;
         GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
-        if (!CryptCATAdminAcquireContext(&hCatAdmin, &action, 0)) {
-            CloseHandle(hFile);
-            return false;
-        }
-
-        DWORD hashLen = 0;
-        CryptCATAdminCalcHashFromFileHandle(hFile, &hashLen, nullptr, 0);
-        if (hashLen == 0) {
-            CryptCATAdminReleaseContext(hCatAdmin, 0);
-            CloseHandle(hFile);
-            return false;
-        }
-        std::vector<BYTE> hash(hashLen);
-        if (!CryptCATAdminCalcHashFromFileHandle(hFile, &hashLen, hash.data(), 0)) {
-            CryptCATAdminReleaseContext(hCatAdmin, 0);
-            CloseHandle(hFile);
-            return false;
-        }
-
-        /* Member tag = hash dạng hex HOA */
-        std::wstring tag;
-        {
-            static const wchar_t* k = L"0123456789ABCDEF";
-            tag.reserve(hashLen * 2);
-            for (DWORD i = 0; i < hashLen; i++) {
-                tag += k[hash[i] >> 4];
-                tag += k[hash[i] & 0x0F];
-            }
-        }
-
         bool ok = false;
-        HCATINFO hCatInfo = CryptCATAdminEnumCatalogFromHash(
-            hCatAdmin, hash.data(), hashLen, 0, nullptr);
 
-        if (hCatInfo) {
-            CATALOG_INFO ci{};
-            ci.cbStruct = sizeof(ci);
-            if (CryptCATCatalogInfoFromContext(hCatInfo, &ci, 0)) {
-                WINTRUST_CATALOG_INFO wtc{};
-                wtc.cbStruct = sizeof(wtc);
-                wtc.pcwszCatalogFilePath = ci.wszCatalogFile;
-                wtc.pcwszMemberTag = tag.c_str();
-                wtc.pcwszMemberFilePath = path.c_str();
-                wtc.hMemberFile = hFile;
-                wtc.pbCalculatedFileHash = hash.data();
-                wtc.cbCalculatedFileHash = hashLen;
-                wtc.hCatAdmin = hCatAdmin;
+        /*
+         * pass 0: SHA-256 (Windows 8 trở lên — đây là đường đúng cho Win10/11)
+         * pass 1: SHA-1   (đường lui cho Windows 7 hoặc catalog đời cũ)
+         */
+        for (int pass = 0; pass < 2 && !ok; pass++) {
+            const bool useSha256 = (pass == 0);
+            HCATADMIN hCatAdmin = nullptr;
 
-                WINTRUST_DATA wd{};
-                wd.cbStruct = sizeof(wd);
-                wd.dwUIChoice = WTD_UI_NONE;
-                wd.fdwRevocationChecks = WTD_REVOKE_NONE;
-                wd.dwUnionChoice = WTD_CHOICE_CATALOG;
-                wd.dwStateAction = WTD_STATEACTION_VERIFY;
-                wd.dwProvFlags = WTD_REVOCATION_CHECK_NONE | WTD_CACHE_ONLY_URL_RETRIEVAL;
-                wd.pCatalog = &wtc;
-
-                GUID g = WINTRUST_ACTION_GENERIC_VERIFY_V2;
-                LONG r = WinVerifyTrust(nullptr, &g, &wd);
-                wd.dwStateAction = WTD_STATEACTION_CLOSE;
-                WinVerifyTrust(nullptr, &g, &wd);
-                ok = (r == ERROR_SUCCESS);
+            if (useSha256) {
+                if (!CryptCATAdminAcquireContext2(&hCatAdmin, &action,
+                    BCRYPT_SHA256_ALGORITHM, nullptr, 0)) continue;
             }
-            CryptCATAdminReleaseCatalogContext(hCatAdmin, hCatInfo, 0);
+            else {
+                if (!CryptCATAdminAcquireContext(&hCatAdmin, &action, 0)) continue;
+            }
+
+            /* Lấy độ dài hash */
+            DWORD hashLen = 0;
+            if (useSha256)
+                CryptCATAdminCalcHashFromFileHandle2(hCatAdmin, hFile, &hashLen, nullptr, 0);
+            else
+                CryptCATAdminCalcHashFromFileHandle(hFile, &hashLen, nullptr, 0);
+
+            if (hashLen == 0) { CryptCATAdminReleaseContext(hCatAdmin, 0); continue; }
+
+            /* Con trỏ file phải về đầu trước mỗi lần băm */
+            SetFilePointer(hFile, 0, nullptr, FILE_BEGIN);
+
+            std::vector<BYTE> hash(hashLen);
+            BOOL okHash = useSha256
+                ? CryptCATAdminCalcHashFromFileHandle2(hCatAdmin, hFile, &hashLen, hash.data(), 0)
+                : CryptCATAdminCalcHashFromFileHandle(hFile, &hashLen, hash.data(), 0);
+
+            if (!okHash) { CryptCATAdminReleaseContext(hCatAdmin, 0); continue; }
+            hash.resize(hashLen);
+
+            /* Tra catalog chứa hash này. Một file có thể nằm trong nhiều catalog
+               (ví dụ sau Windows Update) -> duyệt hết cho tới khi có cái hợp lệ. */
+            HCATINFO hCatInfo = CryptCATAdminEnumCatalogFromHash(
+                hCatAdmin, hash.data(), hashLen, 0, nullptr);
+
+            while (hCatInfo && !ok) {
+                SetFilePointer(hFile, 0, nullptr, FILE_BEGIN);
+                ok = VerifyAgainstCatalog(hCatAdmin, hCatInfo, hFile, path, hash);
+
+                HCATINFO hPrev = hCatInfo;
+                if (!ok) {
+                    hCatInfo = CryptCATAdminEnumCatalogFromHash(
+                        hCatAdmin, hash.data(), hashLen, 0, &hPrev);
+                    /* hPrev đã được API giải phóng khi truyền vào làm prev */
+                }
+                else {
+                    CryptCATAdminReleaseCatalogContext(hCatAdmin, hCatInfo, 0);
+                    hCatInfo = nullptr;
+                }
+            }
+
+            CryptCATAdminReleaseContext(hCatAdmin, 0);
         }
 
-        CryptCATAdminReleaseContext(hCatAdmin, 0);
         CloseHandle(hFile);
         return ok;
     }
 
+    /*
+     * VerifySignature — F1.
+     *
+     * Hai chế độ của WinVerifyTrust:
+     *   WTD_CHOICE_FILE    — chữ ký NHÚNG trong PE (Chrome, 7-Zip, Git, phần
+     *                        mềm thương mại nói chung)
+     *   WTD_CHOICE_CATALOG — chữ ký trong file .cat (phần lớn binary Windows:
+     *                        cmd.exe, conhost.exe, svchost.exe... KHÔNG nhúng
+     *                        chữ ký, Microsoft ký gộp trong catalog)
+     *
+     * Thiếu chế độ thứ hai = F1 bật cho mọi binary Microsoft.
+     */
     inline bool VerifySignature(const std::wstring& path) {
         if (VerifyEmbeddedSignature(path)) return true;
-        return VerifyCatalogSignature(path);   /* <<< thiếu cái này = F1 sai với mọi file MS */
+        return VerifyCatalogSignature(path);
     }
 
     /* ======================================================================
