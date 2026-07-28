@@ -40,6 +40,7 @@
 #include "Util.h"
 #include "Config.h"
 #include "Features.h"
+#include "Featureexporter.h"
 #include "FilterClient.h"
 #include "CowEngine.h"
 #include "StaticAnalyzer.h"
@@ -95,6 +96,42 @@ static std::unique_ptr<CleanupEngine> g_Clean;
 static std::unique_ptr<FilterClient>  g_Filter;
 static HoneyFiles                     g_Honey;
 static MLClient                       g_ML;
+static FeatureExporter                g_FeatureExporter;
+static int                            g_FeatureQuietStride = 1;
+static bool                           g_CollectOnly = false;
+
+struct ExportOptions {
+    std::wstring csvPath;
+    std::string  runId;
+    std::string  label = "unknown";
+    std::wstring targetName;
+    int          quietStride = 1;
+    bool         collectOnly = false;
+};
+
+static ExportOptions ParseExportOptions(int argc, wchar_t** argv) {
+    ExportOptions o;
+    for (int i = 1; i < argc; ++i) {
+        auto next = [&](std::wstring& out) -> bool {
+            if (i + 1 >= argc) return false;
+            out = argv[++i];
+            return true;
+            };
+
+        std::wstring a = argv[i];
+        std::wstring v;
+        if (a == L"--export-csv" && next(v))      o.csvPath = v;
+        else if (a == L"--run-id" && next(v))     o.runId = ws2s(v);
+        else if (a == L"--label" && next(v))      o.label = ws2s(v);
+        else if (a == L"--target-name" && next(v)) o.targetName = v;
+        else if (a == L"--collect-only")             o.collectOnly = true;
+        else if (a == L"--quiet-stride" && next(v)) {
+            int n = _wtoi(v.c_str());
+            o.quietStride = n > 0 ? n : 1;
+        }
+    }
+    return o;
+}
 
 /* ==========================================================================
    HELPER
@@ -241,9 +278,25 @@ static std::vector<std::wstring> StaticScanDirs() {
 }
 
 /*
- * CẢNH BÁO: VerifySignature đang trả FALSE cho cmd.exe, conhost.exe,
- * vssadmin.exe... — không đọc được catalog signature. Hệ quả: bộ lọc này
- * gần như vô hiệu và F1 bật cho 100% tiến trình. Cần sửa trong Util.h.
+ * ===========================================================================
+ * [FIX 27] GHI CHÚ VỀ F1 — comment cũ ở đây ĐÃ LỖI THỜI, nhưng PHẢI KIỂM LẠI
+ * ===========================================================================
+ * Comment cũ: "VerifySignature dang tra FALSE cho cmd.exe, conhost.exe,
+ * vssadmin.exe... Can sua trong Util.h."
+ *
+ * Thực tế hiện tại: VerifySignature KHÔNG nằm trong Util.h mà ở
+ * StaticAnalyzer.h, và nó ĐÃ có đường catalog (CryptCATAdminAcquireContext2
+ * với SHA-256, fallback SHA-1 cho Win7). Nghĩa là comment nhiều khả năng là
+ * tàn dư từ trước khi vá.
+ *
+ * NHƯNG: nếu comment vẫn đúng thì F1 = 1 cho MỌI tiến trình, tức là
+ *   - F1 thành cột hằng số, vô dụng khi train;
+ *   - mọi score bị cộng thêm 1, nên cổng SCORE_ML_TRIGGER=6 thực chất là 5.
+ * Cả hai đều làm hỏng số liệu.
+ *
+ * -> CHẠY SigSelfTest.cpp TRƯỚC KHI THU THẬP DỮ LIỆU. Nếu nó báo tất cả
+ *    OK thì xoá luôn khối chú thích này.
+ * ===========================================================================
  */
 static bool ShouldAnalyzeStatically(const std::wstring& img) {
     std::wstring low = ToLower(img);
@@ -347,6 +400,13 @@ static void RunStaticForPid(DWORD pid) {
    XỬ LÝ PHÁN QUYẾT MALWARE
    ========================================================================== */
 static void HandleMalwareVerdict(DWORD pid, double conf) {
+    // Dataset collection mode: keep observing and exporting features.
+    // Do not deny, restore, suspend, or terminate the target process.
+    if (g_CollectOnly) {
+        LOG_W("[COLLECT] Bo qua enforcement cho PID=%lu (conf=%.2f).", pid, conf);
+        return;
+    }
+
     LOG_A("[KILL] === MALWARE (conf=%.2f) PID=%lu ===", conf, pid);
 
     {
@@ -602,6 +662,10 @@ static void MaybeTriggerNoML(DWORD pid) {
 }
 
 static inline void TriggerVerdict(DWORD pid) {
+    // During training-data collection, total_score is still calculated and
+    // snapshots are still exported, but score >= threshold must not enforce.
+    if (g_CollectOnly) return;
+
 #if RW_BYPASS_ML
     MaybeTriggerNoML(pid);
 #else
@@ -622,22 +686,51 @@ static bool IsKnownRansomExt(const std::wstring& ext) {
     return k.count(ext) > 0;
 }
 
+/*
+ * [FIX 22] ĐẾM THEO CỬA SỔ, KHÔNG TÍCH LUỸ.
+ *
+ * Bản cũ: int n = ++pf.newExtHistogram[ext];  return n >= 5;
+ * Đây đúng là lỗi mà v3.0 đã sửa cho ioOperationsCount nhưng bỏ sót ở đây:
+ * bộ đếm chỉ tăng, không bao giờ giảm. Một tiến trình benign sinh file tạm
+ * với đuôi lạ (.tmp2, .part, .~lock) chạy đủ lâu sẽ chạm 5 và bật F11.
+ *
+ * Ransomware khác biệt ở MẬT ĐỘ: 5 file cùng đuôi mới trong 30 giây.
+ */
 static bool IsMassNewExtension(ProcessFeature& pf, const std::wstring& ext) {
     if (ext.empty() || ext.size() > 12) return false;
     if (cfg::VALUABLE_EXTS.count(ext) || cfg::EXECUTABLE_EXTS.count(ext)) return false;
-    int n = ++pf.newExtHistogram[ext];
-    return n >= 5;
+    auto& sc = pf.newExtHistogram[ext];
+    sc.Add();
+    return sc.Count() >= 5;
 }
 
+/*
+ * [FIX 20] F12 KHÔNG CÒN PHỤ THUỘC VÀO VIỆC BACKUP THÀNH CÔNG.
+ *
+ * Bản cũ chỉ tra FindEntry(): không có bản sao -> không có magicBefore ->
+ * F12 câm, dù file bị mã hoá rành rành. Mà backup trượt ở rất nhiều đường
+ * bình thường (size_too_big, quota_frozen, sharing violation).
+ *
+ * Giờ ưu tiên entry (đã có sẵn), thiếu thì lấy từ bảng pre-metadata mà
+ * CowEngine chụp cho MỌI file được pend.
+ */
 static bool CheckFingerprint(ProcessFeature& pf, const std::wstring& path) {
-    const BackupEntry* e = g_Cow->FindEntry(pf, path);
-    if (!e || e->magicBefore.empty()) return false;
+    std::string before;
+
+    if (const BackupEntry* e = g_Cow->FindEntry(pf, path))
+        before = e->magicBefore;
+
+    if (before.empty()) {
+        CowEngine::PreMeta pm;
+        if (g_Cow->FindPreMeta(path, pm)) before = pm.magicHex;
+    }
+    if (before.empty()) return false;
 
     std::string now = FileMagicHex(path);
-    if (now.empty() || now == e->magicBefore) return false;
+    if (now.empty() || now == before) return false;
 
     LOG_D("      F12: magic %s -> %s  (%s)",
-        e->magicBefore.substr(0, 8).c_str(), now.substr(0, 8).c_str(),
+        before.substr(0, 8).c_str(), now.substr(0, 8).c_str(),
         ws2s(GetFileNameOnly(path)).c_str());
     return true;
 }
@@ -796,6 +889,18 @@ static ULONG OnEvent(const RW_EVENT& ev) {
 
         bool ok = g_Cow->OnFirstTouch(pid, path, root, ev.DirEntryCount);
 
+        /* [FIX 24-R] Đếm CoW theo tiến trình — phải RẺ.
+           KHÔNG dùng EnsurePf ở đây: nó gọi GetProcessStartTime +
+           GetProcessImagePath khi tạo mới, tức là hai lần truy vấn tiến trình
+           ngay trong đường pend. Chỉ đụng vào map, để EnsurePf ở nơi khác lo
+           phần khởi tạo. */
+        {
+            std::lock_guard<std::mutex> lk(g_Mtx);
+            auto& rpf = g_Collector[root];
+            rpf.cowFiles++;
+            if (!ok) rpf.cowFailed++;
+        }
+
         TriggerVerdict(root);
 
         if (!ok) {
@@ -884,28 +989,52 @@ static ULONG OnEvent(const RW_EVENT& ev) {
             if (!pf.f12_fingerprintMismatch.value && CheckFingerprint(childPf, path))
                 pf.Raise(pf.f12_fingerprintMismatch, "F12 dau van tay file khong khop");
 
+            /* [FIX 20] F13 cũng lấy được entropyBefore từ pre-metadata khi
+               không có bản backup. Xem chú thích ở CheckFingerprint. */
             if (!pf.f13_highEntropy.value) {
-                const BackupEntry* e = g_Cow->FindEntry(childPf, path);
-                if (e) {
+                double hBefore = -1.0;
+
+                if (const BackupEntry* e = g_Cow->FindEntry(childPf, path))
+                    hBefore = e->entropyBefore;
+
+                if (hBefore < 0) {
+                    CowEngine::PreMeta pm;
+                    if (g_Cow->FindPreMeta(path, pm) && pm.valid) hBefore = pm.entropy;
+                }
+
+                if (hBefore >= 0) {
                     double hNow = FileEntropy(path, cfg::ENTROPY_SAMPLE_BYTES);
                     if (hNow > 0) {
-                        double d = hNow - e->entropyBefore;
+                        double d = hNow - hBefore;
                         childPf.entropyDelta.Add(d);
                         if (&pf != &childPf) pf.entropyDelta.Add(d);
+
+                        /* [FIX 23] giữ giá trị liên tục cho dataset */
+                        if (d > pf.entropyDeltaMax) pf.entropyDeltaMax = d;
+                        if (d > childPf.entropyDeltaMax) childPf.entropyDeltaMax = d;
+
                         bool hit = (d > cfg::ENTROPY_DELTA_THRESHOLD) ||
                             (hNow > cfg::ENTROPY_ABS_THRESHOLD && d > 0.5);
                         if (hit) {
                             LOG_D("      F13: H %.2f -> %.2f  (dH=+%.2f)  %s",
-                                e->entropyBefore, hNow, d, ws2s(GetFileNameOnly(path)).c_str());
+                                hBefore, hNow, d, ws2s(GetFileNameOnly(path)).c_str());
                             pf.Raise(pf.f13_highEntropy, "F13 delta entropy cao (ma hoa)");
                         }
                     }
                 }
             }
 
-            /* F14 — Differential Area Analysis (Davies et al., arXiv:2106.14418) */
+            /* F14 — Differential Area Analysis (Davies et al., arXiv:2106.14418)
+               [FIX 23-R] GIỮ NGUYÊN điều kiện gốc (!f14 && valuable). Bản
+               v4.5.0 tính lại DAA cả sau khi F14 đã bật để lấy daa_min cho
+               dataset — thêm một lần đọc file trên mỗi write event, làm nặng
+               thêm hàng đợi listener. Giá trị liên tục không đáng để đánh đổi
+               thông lượng: vẫn ghi daaMin, nhưng chỉ ở lần tính duy nhất. */
             if (!pf.f14_daa.value && cfg::VALUABLE_EXTS.count(ext)) {
-                double daa = DifferentialAreaAnalysis(path);
+                double daa = DifferentialAreaAnalysis(path);   /* 9999 = khong doc duoc */
+                if (daa < pf.daaMin) pf.daaMin = daa;
+                if (daa < childPf.daaMin) childPf.daaMin = daa;
+
                 if (daa < cfg::DAA_THRESHOLD) {
                     LOG_D("      F14: DAA=%.2f Bit-Bytes  %s",
                         daa, ws2s(GetFileNameOnly(path)).c_str());
@@ -1130,6 +1259,9 @@ static void MaintenanceThread() {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         tick++;
 
+        if (g_FeatureExporter.Enabled())
+            g_FeatureExporter.Snapshot(g_Mtx, g_Collector, g_FeatureQuietStride);
+
         if (tick % cfg::HEARTBEAT_INTERVAL_SEC == 0) CleanupEngine::WriteHeartbeat();
         if (tick % 5 == 0) g_Cow->FlushDirtyManifests();
         if (tick % cfg::EARLY_CLEANUP_INTERVAL_SEC == 0) g_Clean->EarlyCleanupPass();
@@ -1198,7 +1330,7 @@ static void StatusThread() {
 /* ==========================================================================
    MAIN
    ========================================================================== */
-int wmain() {
+int wmain(int argc, wchar_t** argv) {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -1225,18 +1357,45 @@ int wmain() {
 #endif
     rw::Logger::I().SetFileLevel(rw::LogLevel::Debug);
 
+    ExportOptions exportOpt = ParseExportOptions(argc, argv);
+    g_CollectOnly = exportOpt.collectOnly;
+
+    if (g_CollectOnly && exportOpt.csvPath.empty()) {
+        LOG_E("--collect-only can --export-csv de luu dataset.");
+        return 2;
+    }
+
+    if (!exportOpt.csvPath.empty()) {
+        g_FeatureQuietStride = exportOpt.quietStride;
+        if (!g_FeatureExporter.Init(exportOpt.csvPath, exportOpt.runId,
+            exportOpt.label, exportOpt.targetName)) {
+            LOG_E("Khong khoi tao duoc feature exporter. Thoat.");
+            return 2;
+        }
+    }
+
     printf("\n");
     printf("  ==========================================\n");
     printf("        RansomWall v4.4\n");
     printf("     CoW Engine + 14 Features + ML\n");
+    if (g_CollectOnly) {
+        printf("     *** COLLECT-ONLY: KHONG ML / KHONG KILL ***\n");
+    }
 #if RW_BYPASS_ML
-    printf("     *** CHE DO BO QUA ML (score>=%d = KILL) ***\n", cfg::SCORE_ML_TRIGGER);
+    else {
+        printf("     *** CHE DO BO QUA ML (score>=%d = KILL) ***\n", cfg::SCORE_ML_TRIGGER);
+    }
 #endif
     printf("  ==========================================\n\n");
 
+    if (g_CollectOnly) {
+        LOG_W("[COLLECT] Dang thu dataset: van tinh score va ghi CSV, KHONG goi ML/KHONG kill.");
+    }
 #if RW_BYPASS_ML
-    LOG_W("[!] RW_BYPASS_ML=1 — score >= %d se KILL NGAY khong hoi ML.",
-        cfg::SCORE_ML_TRIGGER);
+    else {
+        LOG_W("[!] RW_BYPASS_ML=1 — score >= %d se KILL NGAY khong hoi ML.",
+            cfg::SCORE_ML_TRIGGER);
+    }
 #endif
 
     BOOL isAdmin = FALSE;
@@ -1307,6 +1466,10 @@ int wmain() {
     g_Running = false;
     if (g_Filter) g_Filter->Disconnect();
     if (g_Cow)    g_Cow->FlushDirtyManifests();
+    if (g_FeatureExporter.Enabled()) {
+        g_FeatureExporter.Snapshot(g_Mtx, g_Collector, 1);
+        g_FeatureExporter.Close();
+    }
     CleanupEngine::ClearHeartbeat();
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     CoUninitialize();

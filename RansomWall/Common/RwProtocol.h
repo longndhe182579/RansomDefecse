@@ -22,6 +22,27 @@
  *            Event này gửi KHÔNG PEND (IsPending=0) — không chặn IRP, không
  *            round-trip 200ms. Chỉ để user-space kiểm honey file (F4) và
  *            đếm mật độ I/O.
+ *
+ * ===========================================================================
+ * BẢN VÁ v4.5
+ * ===========================================================================
+ *   [FIX 21] SỬA MÔ TẢ SAI CỦA TRƯỜNG FileRef.
+ *
+ *            Comment cũ khai FileRef là "FileInternalInformation — bất biến
+ *            khi rename". SAI. Driver.c::HandleMutation gán:
+ *
+ *                ev.FileRef = PathHash64(name);
+ *
+ *            Đây là BĂM ĐƯỜNG DẪN, không phải file ID của NTFS. Hệ quả thật:
+ *              - Đổi tên file rồi ghi  -> key khác  -> first-touch lần hai
+ *                -> backup thêm một bản. Tốn quota nhưng AN TOÀN.
+ *              - Hard link / junction trỏ tới cùng file -> hai key khác nhau.
+ *              - KHÔNG có chuyện "bất biến khi rename".
+ *
+ *            Nếu sau này muốn đúng nghĩa file ID, phải gọi
+ *            FltQueryInformationFile(FileInternalInformation) trong pre-op —
+ *            tốn thêm một round-trip xuống file system, cân nhắc kỹ với
+ *            ngân sách 200ms.
  * ===========================================================================
  */
 
@@ -56,6 +77,11 @@ typedef enum _RW_ACTION {
      * Honey file là BẪY: chạm vào là đủ, không cần chờ nó bị ghi.
      * Đây là tín hiệu NHANH NHẤT có được — ransomware phải đọc trước khi
      * mã hoá, nên event này đến sớm hơn mọi feature khác.
+     *
+     * LƯU Ý CHÍNH XÁC: event này sinh trong PreCreate khi DesiredAccess có
+     * FILE_READ_DATA/GENERIC_READ. Đó là "MỞ file với ý định đọc", MỘT LẦN
+     * cho mỗi handle — KHÔNG phải mỗi thao tác đọc. Driver KHÔNG hook
+     * IRP_MJ_READ. Đừng mô tả F10 là "đếm số thao tác đọc".
      */
     RwActionRead = 8
 } RW_ACTION;
@@ -75,7 +101,11 @@ typedef struct _RW_EVENT {
 
     unsigned long   DirEntryCount;  /* RwActionDirQuery: số entry
                                        RwActionWrite (pend): NT create disposition */
-    long long       FileRef;        /* FileInternalInformation — bất biến khi rename */
+
+                                       /* [FIX 21] BĂM ĐƯỜNG DẪN (PathHash64), KHÔNG phải FileInternalInformation.
+                                          Đổi tên file -> giá trị này ĐỔI THEO. Xem đầu file. */
+    long long       FileRef;
+
     unsigned long long ProcessStartTime; /* FILETIME — chống PID reuse            */
 
     wchar_t         FilePath[RW_MAX_PATH];      /* kernel format \Device\Harddisk... */
