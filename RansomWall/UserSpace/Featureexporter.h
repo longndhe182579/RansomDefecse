@@ -46,6 +46,7 @@
 #include <string>
 #include <vector>
 #include <cstdio>
+#include <share.h>
 
 namespace rw {
 
@@ -72,21 +73,28 @@ namespace rw {
             }
             else runId_ = runId;
 
-            bool isNew = true;
-            {
-                FILE* probe = nullptr;
-                if (_wfopen_s(&probe, path_.c_str(), L"rb") == 0 && probe) {
-                    fseek(probe, 0, SEEK_END);
-                    isNew = (ftell(probe) == 0);
-                    fclose(probe);
-                }
+            // File của run trước được đặt Read-only khi đóng. Gỡ cờ đó trước
+            // khi append run mới; trong lúc tiến trình đang chạy, khóa chia sẻ
+            // bên dưới mới là lớp bảo vệ chính.
+            DWORD attrs = GetFileAttributesW(path_.c_str());
+            if (attrs != INVALID_FILE_ATTRIBUTES &&
+                (attrs & FILE_ATTRIBUTE_READONLY)) {
+                SetFileAttributesW(path_.c_str(),
+                    attrs & ~FILE_ATTRIBUTE_READONLY);
             }
 
-            if (_wfopen_s(&f_, path_.c_str(), L"ab") != 0 || !f_) {
-                LOG_E("[CSV] Khong mo duoc %s", ws2s(path_).c_str());
+            // _SH_DENYWR: tiến trình khác vẫn có thể đọc CSV, nhưng không thể
+            // mở thêm handle ghi trong suốt phiên thu thập. CRT cũng không chia
+            // sẻ quyền DELETE, nên thao tác đổi tên/xóa thông thường sẽ thất bại
+            // cho tới khi exporter đóng file.
+            if (_wfsopen_s(&f_, path_.c_str(), L"a+b", _SH_DENYWR) != 0 || !f_) {
+                LOG_E("[CSV] Khong mo/khong khoa duoc %s", ws2s(path_).c_str());
                 f_ = nullptr;
                 return false;
             }
+
+            fseek(f_, 0, SEEK_END);
+            const bool isNew = (ftell(f_) == 0);
 
             if (isNew) {
                 std::string h = Header();
@@ -161,7 +169,21 @@ namespace rw {
                 fflush(f_);
                 fclose(f_);
                 f_ = nullptr;
-                LOG_I("[CSV] Da ghi %llu dong vao %s", rows_, ws2s(path_).c_str());
+
+                // Sau khi hoàn tất run, đặt Read-only để tránh ghi nhầm và
+                // giảm khả năng một mẫu thông thường sửa file khi exporter
+                // không còn giữ khóa. Đây là lớp phụ, không thay thế ACL/VM.
+                DWORD attrs = GetFileAttributesW(path_.c_str());
+                if (attrs != INVALID_FILE_ATTRIBUTES) {
+                    if (!SetFileAttributesW(path_.c_str(),
+                        attrs | FILE_ATTRIBUTE_READONLY)) {
+                        LOG_W("[CSV] Khong dat duoc Read-only: %s (err=%lu)",
+                            ws2s(path_).c_str(), GetLastError());
+                    }
+                }
+
+                LOG_I("[CSV] Da ghi %llu dong vao %s (da khoa Read-only)",
+                    rows_, ws2s(path_).c_str());
             }
         }
 
