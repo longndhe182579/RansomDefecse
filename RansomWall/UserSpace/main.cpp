@@ -117,21 +117,30 @@ static int ScoreOf(DWORD pid) {
     return (it != g_Collector.end()) ? it->second.totalScore : 0;
 }
 
-static bool IsCriticalSystemProcess(const ProcessFeature& pf) {
-    std::wstring n = ToLower(GetFileNameOnly(pf.processImage));
-    static const std::set<std::wstring> names = {
-        L"explorer.exe", L"svchost.exe", L"services.exe", L"lsass.exe",
-        L"winlogon.exe", L"csrss.exe", L"wininit.exe", L"smss.exe",
-        L"dwm.exe", L"taskhostw.exe",
-    };
-    if (!names.count(n)) return false;
+static bool IsCriticalSystemProcess(const std::wstring& imagePath) {
+    std::wstring n = ToLower(GetFileNameOnly(imagePath));
+    bool nameMatch = n == L"explorer.exe" || n == L"svchost.exe" ||
+        n == L"services.exe" || n == L"lsass.exe" ||
+        n == L"winlogon.exe" || n == L"csrss.exe" ||
+        n == L"wininit.exe" || n == L"smss.exe" ||
+        n == L"dwm.exe" || n == L"taskhostw.exe";
+    if (!nameMatch) return false;
 
-    std::wstring low = ToLower(pf.processImage);
-    bool inSystemDir = false;
-    for (auto& d : cfg::SYSTEM_DIRS)
-        if (low.rfind(d, 0) == 0) { inSystemDir = true; break; }
-
-    return inSystemDir && !pf.f1_unsigned.value;  // đúng path VÀ có chữ ký hợp lệ
+    /* [FIX] Tên trùng KHÔNG đủ — ransomware tự đặt tên "svchost.exe" chạy
+       ngoài System32 để lợi dụng đúng bộ lọc này. PHẢI xác nhận đường dẫn
+       nằm trong thư mục hệ thống thật, không chỉ trùng tên file.
+       Log thật: PID=15348 "svchost.exe" chạy từ ngoài System32, score=6,
+       bị NO-ML bỏ qua vì code cũ chỉ so tên. */
+    std::wstring low = ToLower(imagePath);
+    bool inSystemDir =
+        low.find(L"\\windows\\system32\\") != std::wstring::npos ||
+        low.find(L"\\windows\\syswow64\\") != std::wstring::npos;
+    if (!inSystemDir) {
+        LOG_W("[!] Ten trung he thong nhung SAI DUONG DAN (gia mao): %s",
+            ws2s(imagePath).c_str());
+        return false;
+    }
+    return true;
 }
 
 /* ==========================================================================
@@ -396,9 +405,7 @@ static void HandleMalwareVerdict(DWORD pid, double conf) {
                 }
                 if (img.empty()) img = GetProcessImagePath(p);
 
-                rw::ProcessFeature pf{};
-                pf.processImage = img;
-                if (IsCriticalSystemProcess(pf)) {
+                if (IsCriticalSystemProcess(img)) {
                     LOG_W("   [BO QUA] KHONG kill %s (PID=%lu) — tien trinh he thong.",
                         ws2s(GetFileNameOnly(img)).c_str(), p);
                     continue;
@@ -576,7 +583,7 @@ static void MaybeTriggerNoML(DWORD pid) {
         if (pf.ml.verdictHandled) return;
         if (pf.totalScore < cfg::SCORE_ML_TRIGGER) return;
 
-        if (IsCriticalSystemProcess(pf)) {
+        if (IsCriticalSystemProcess(pf.processImage)) {
             LOG_W("[NO-ML] PID=%lu score=%d nhung la %s — BO QUA.",
                 pid, pf.totalScore, ws2s(GetFileNameOnly(pf.processImage)).c_str());
             pf.ml.verdictHandled = true;
