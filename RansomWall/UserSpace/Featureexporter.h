@@ -46,7 +46,9 @@
 #include <string>
 #include <vector>
 #include <cstdio>
-#include <share.h>
+#include <cstdint>
+#include <io.h>
+#include <fcntl.h>
 
 namespace rw {
 
@@ -83,18 +85,53 @@ namespace rw {
                     attrs & ~FILE_ATTRIBUTE_READONLY);
             }
 
-            // _SH_DENYWR: tiến trình khác vẫn có thể đọc CSV, nhưng không thể
-            // mở thêm handle ghi trong suốt phiên thu thập. CRT cũng không chia
-            // sẻ quyền DELETE, nên thao tác đổi tên/xóa thông thường sẽ thất bại
-            // cho tới khi exporter đóng file.
-            if (_wfsopen_s(&f_, path_.c_str(), L"a+b", _SH_DENYWR) != 0 || !f_) {
-                LOG_E("[CSV] Khong mo/khong khoa duoc %s", ws2s(path_).c_str());
-                f_ = nullptr;
+            // Mở bằng WinAPI để kiểm soát share mode trên cả x64 và ARM64.
+            // Chỉ chia sẻ quyền đọc: tiến trình khác không thể mở để ghi,
+            // xóa hoặc đổi tên file trong khi exporter đang giữ handle.
+            HANDLE h = CreateFileW(
+                path_.c_str(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ,
+                nullptr,
+                OPEN_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr);
+
+            if (h == INVALID_HANDLE_VALUE) {
+                LOG_E("[CSV] CreateFileW that bai: %s (err=%lu)",
+                    ws2s(path_).c_str(), GetLastError());
                 return false;
             }
 
-            fseek(f_, 0, SEEK_END);
-            const bool isNew = (ftell(f_) == 0);
+            LARGE_INTEGER fileSize{};
+            const bool isNew = GetFileSizeEx(h, &fileSize) && fileSize.QuadPart == 0;
+
+            LARGE_INTEGER zero{};
+            if (!SetFilePointerEx(h, zero, nullptr, FILE_END)) {
+                LOG_E("[CSV] Khong seek duoc cuoi file: %s (err=%lu)",
+                    ws2s(path_).c_str(), GetLastError());
+                CloseHandle(h);
+                return false;
+            }
+
+            // Chuyển HANDLE sang FILE* để giữ nguyên phần fwrite/fflush hiện có.
+            // Sau khi chuyển thành công, fclose(f_) sẽ đóng cả descriptor và HANDLE.
+            int fd = _open_osfhandle(
+                reinterpret_cast<intptr_t>(h),
+                _O_APPEND | _O_BINARY);
+            if (fd == -1) {
+                LOG_E("[CSV] _open_osfhandle that bai: %s",
+                    ws2s(path_).c_str());
+                CloseHandle(h);
+                return false;
+            }
+
+            f_ = _fdopen(fd, "ab");
+            if (!f_) {
+                LOG_E("[CSV] _fdopen that bai: %s", ws2s(path_).c_str());
+                _close(fd); // đồng thời đóng HANDLE đã chuyển quyền sở hữu
+                return false;
+            }
 
             if (isNew) {
                 std::string h = Header();
