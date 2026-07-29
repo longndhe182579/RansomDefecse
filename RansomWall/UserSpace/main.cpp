@@ -1,27 +1,49 @@
 /*
- * main.cpp — RansomWall v4.4 User-Space Engine
+ * main.cpp — RansomWall v4.5 User-Space Engine
  *
  * ===========================================================================
- * BẢN VÁ v4.4
+ * BẢN VÁ v4.5 — THU THẬP FEATURE ĐỂ TRAIN ML
  * ===========================================================================
- *   [FIX 11] Xử lý RwActionRead — sự kiện MỞ ĐỌC file giá trị.
+ *   [FIX 20] Tích hợp FeatureExport.h.
  *
- *            Chaos đọc file gốc rồi ghi ra file mới "<goc>.1bnp" và xoá gốc.
- *            Đường GHI không bao giờ thấy gì. Event ĐỌC là tín hiệu duy nhất
- *            đến ĐÚNG LÚC — và honey file là bẫy hoàn hảo cho nó: chạm là đủ,
- *            không cần chờ bị ghi.
+ *            Snapshot toàn bộ collector ra CSV mỗi tick MaintenanceThread.
+ *            KHÔNG gọi từ OnEvent — không đụng đường nóng của driver.
  *
- *            Event này KHÔNG PEND -> chỉ tính điểm, không backup, không DENY.
+ *            Tham số dòng lệnh:
+ *              --csv <duong_dan>     bật ghi CSV (bắt buộc để thu dữ liệu)
+ *              --label <chuoi>       nhãn mức run: malware / benign
+ *              --target-name <chuoi> chuỗi con tên file mẫu -> cột is_target
+ *              --run-id <chuoi>      để trống thì tự sinh theo thời gian
+ *              --stride <n>          tiến trình im lặng lấy mẫu mỗi n tick
+ *              --observe             KHÔNG kill, chỉ quan sát (xem FIX 21)
  *
- *   [FIX 12] KHÔNG BACKUP HONEY FILE.
+ *   [FIX 21] --observe: score >= SCORE_ML_TRIGGER KHÔNG kill nữa.
  *
- *            110 honey file (.txt/.xlsx/.pdf) đều nằm trong VALUABLE_EXTS nên
- *            v4.3 backup hết -> ngốn quota của tiến trình thật.
- *            Honey là BẪY, không phải dữ liệu. Mất cũng không sao.
+ *            Mục đích: để mẫu chạy trọn vòng đời, thu được feature ở giai
+ *            đoạn mã hoá thật sự chứ không phải cắt ngang lúc mới 6 điểm.
+ *
+ *            Chế độ này tắt luôn 2 cơ chế phòng thủ khác vì chúng làm MÉO
+ *            dữ liệu:
+ *              - DENY IRP  -> mẫu nhận ACCESS_DENIED sẽ đổi hành vi.
+ *              - backupFrozen -> đóng băng backup ở SCORE_FREEZE nghĩa là
+ *                không còn BackupEntry mới, mà F12/F13 đều dựa vào
+ *                FindEntry() -> hai feature quan trọng nhất tắt đúng lúc
+ *                mẫu mã hoá mạnh nhất.
+ *
+ *            *** CHỈ CHẠY TRONG VM CÓ SNAPSHOT. Máy sau run là máy đã bị
+ *            mã hoá — không có restore, không có CleanRansomArtifacts. ***
+ *
+ *   [FIX 22] Cập nhật các trường mà FeatureExport đọc nhưng code cũ không
+ *            bao giờ ghi: entropyDeltaMax, daaMin, exited.
+ *            Khi bật --csv thì bỏ chặn latch cho F13/F14 để entropy và DAA
+ *            tiếp tục được tính sau khi feature đã bật (biến liên tục có giá
+ *            trị nhất cho ML). Latch vẫn giữ nguyên cho việc Raise().
  *
  * ===========================================================================
  * BẢN VÁ CŨ (giữ nguyên)
  * ===========================================================================
+ *   [FIX 11] Xử lý RwActionRead — sự kiện MỞ ĐỌC file giá trị.
+ *   [FIX 12] KHÔNG BACKUP HONEY FILE.
  *   [FIX 10] Truyền disposition xuống CoW + PROBE chẩn đoán err=2.
  *   [TẠM]    RW_BYPASS_ML — score >= SCORE_ML_TRIGGER là kill ngay.
  *   [CHẶN]   Không kill explorer/svchost/services...
@@ -40,7 +62,7 @@
 #include "Util.h"
 #include "Config.h"
 #include "Features.h"
-#include "Featureexporter.h"
+#include "Featureexporter.h"      /* [FIX 20] */
 #include "FilterClient.h"
 #include "CowEngine.h"
 #include "StaticAnalyzer.h"
@@ -54,6 +76,7 @@
 #include <map>
 #include <set>
 #include <regex>
+#include <cstdlib>
 
 using namespace rw;
 
@@ -76,6 +99,11 @@ static std::atomic<uint64_t> g_EvRead{ 0 };     /* [FIX 11] đếm event mở đ
 static std::atomic<uint64_t> g_CowFail{ 0 };
 static std::atomic<uint64_t> g_CowDeny{ 0 };
 
+/* [FIX 20] [FIX 21] Xuất feature + chế độ quan sát */
+static FeatureExporter       g_Csv;
+static std::atomic<bool>     g_Observe{ false };
+static int                   g_CsvStride = 10;
+
 static std::mutex                          g_StaticMtx;
 static std::map<std::string, StaticResult> g_StaticCache;
 static std::set<std::string>               g_StaticInFlight;
@@ -96,42 +124,6 @@ static std::unique_ptr<CleanupEngine> g_Clean;
 static std::unique_ptr<FilterClient>  g_Filter;
 static HoneyFiles                     g_Honey;
 static MLClient                       g_ML;
-static FeatureExporter                g_FeatureExporter;
-static int                            g_FeatureQuietStride = 1;
-static bool                           g_CollectOnly = false;
-
-struct ExportOptions {
-    std::wstring csvPath;
-    std::string  runId;
-    std::string  label = "unknown";
-    std::wstring targetName;
-    int          quietStride = 1;
-    bool         collectOnly = false;
-};
-
-static ExportOptions ParseExportOptions(int argc, wchar_t** argv) {
-    ExportOptions o;
-    for (int i = 1; i < argc; ++i) {
-        auto next = [&](std::wstring& out) -> bool {
-            if (i + 1 >= argc) return false;
-            out = argv[++i];
-            return true;
-            };
-
-        std::wstring a = argv[i];
-        std::wstring v;
-        if (a == L"--export-csv" && next(v))      o.csvPath = v;
-        else if (a == L"--run-id" && next(v))     o.runId = ws2s(v);
-        else if (a == L"--label" && next(v))      o.label = ws2s(v);
-        else if (a == L"--target-name" && next(v)) o.targetName = v;
-        else if (a == L"--collect-only")             o.collectOnly = true;
-        else if (a == L"--quiet-stride" && next(v)) {
-            int n = _wtoi(v.c_str());
-            o.quietStride = n > 0 ? n : 1;
-        }
-    }
-    return o;
-}
 
 /* ==========================================================================
    HELPER
@@ -278,25 +270,9 @@ static std::vector<std::wstring> StaticScanDirs() {
 }
 
 /*
- * ===========================================================================
- * [FIX 27] GHI CHÚ VỀ F1 — comment cũ ở đây ĐÃ LỖI THỜI, nhưng PHẢI KIỂM LẠI
- * ===========================================================================
- * Comment cũ: "VerifySignature dang tra FALSE cho cmd.exe, conhost.exe,
- * vssadmin.exe... Can sua trong Util.h."
- *
- * Thực tế hiện tại: VerifySignature KHÔNG nằm trong Util.h mà ở
- * StaticAnalyzer.h, và nó ĐÃ có đường catalog (CryptCATAdminAcquireContext2
- * với SHA-256, fallback SHA-1 cho Win7). Nghĩa là comment nhiều khả năng là
- * tàn dư từ trước khi vá.
- *
- * NHƯNG: nếu comment vẫn đúng thì F1 = 1 cho MỌI tiến trình, tức là
- *   - F1 thành cột hằng số, vô dụng khi train;
- *   - mọi score bị cộng thêm 1, nên cổng SCORE_ML_TRIGGER=6 thực chất là 5.
- * Cả hai đều làm hỏng số liệu.
- *
- * -> CHẠY SigSelfTest.cpp TRƯỚC KHI THU THẬP DỮ LIỆU. Nếu nó báo tất cả
- *    OK thì xoá luôn khối chú thích này.
- * ===========================================================================
+ * CẢNH BÁO: VerifySignature đang trả FALSE cho cmd.exe, conhost.exe,
+ * vssadmin.exe... — không đọc được catalog signature. Hệ quả: bộ lọc này
+ * gần như vô hiệu và F1 bật cho 100% tiến trình. Cần sửa trong Util.h.
  */
 static bool ShouldAnalyzeStatically(const std::wstring& img) {
     std::wstring low = ToLower(img);
@@ -400,13 +376,6 @@ static void RunStaticForPid(DWORD pid) {
    XỬ LÝ PHÁN QUYẾT MALWARE
    ========================================================================== */
 static void HandleMalwareVerdict(DWORD pid, double conf) {
-    // Dataset collection mode: keep observing and exporting features.
-    // Do not deny, restore, suspend, or terminate the target process.
-    if (g_CollectOnly) {
-        LOG_W("[COLLECT] Bo qua enforcement cho PID=%lu (conf=%.2f).", pid, conf);
-        return;
-    }
-
     LOG_A("[KILL] === MALWARE (conf=%.2f) PID=%lu ===", conf, pid);
 
     {
@@ -582,6 +551,12 @@ static void CallML(DWORD pid) {
         }
     }
 
+    /* [FIX 21] Trong che do quan sat, ML co ket luan gi cung khong kill. */
+    if (handleMalware && g_Observe) {
+        LOG_A("[OBSERVE] ML bao MALWARE cho PID=%lu — KHONG kill (che do quan sat).", pid);
+        return;
+    }
+
     if (handleMalware) {
         HandleMalwareVerdict(pid, resp.confidence);
         return;
@@ -650,6 +625,27 @@ static void MaybeTriggerNoML(DWORD pid) {
             return;
         }
 
+        /* ==================================================================
+           [FIX 21] CHE DO QUAN SAT — KHONG KILL
+           ==================================================================
+           KHONG set verdictHandled: tien trinh tiep tuc duoc cham diem va
+           tiep tuc xuat hien trong CSV cho den khi no tu thoat.
+
+           Chi log khi score TANG, neu khong se spam moi event mot dong.
+           s_logged duoc truy cap DUOI g_Mtx nen an toan.
+           ================================================================== */
+        if (g_Observe) {
+            static std::map<DWORD, int> s_logged;
+            int& last = s_logged[pid];
+            if (pf.totalScore > last) {
+                last = pf.totalScore;
+                LOG_A("[OBSERVE] PID=%lu score=%d/14 — KHONG kill, tiep tuc ghi feature. %s",
+                    pid, pf.totalScore,
+                    ws2s(GetFileNameOnly(pf.processImage)).c_str());
+            }
+            return;
+        }
+
         pf.ml.verdictHandled = true;
         score = pf.totalScore;
         go = true;
@@ -662,10 +658,6 @@ static void MaybeTriggerNoML(DWORD pid) {
 }
 
 static inline void TriggerVerdict(DWORD pid) {
-    // During training-data collection, total_score is still calculated and
-    // snapshots are still exported, but score >= threshold must not enforce.
-    if (g_CollectOnly) return;
-
 #if RW_BYPASS_ML
     MaybeTriggerNoML(pid);
 #else
@@ -686,51 +678,26 @@ static bool IsKnownRansomExt(const std::wstring& ext) {
     return k.count(ext) > 0;
 }
 
-/*
- * [FIX 22] ĐẾM THEO CỬA SỔ, KHÔNG TÍCH LUỸ.
- *
- * Bản cũ: int n = ++pf.newExtHistogram[ext];  return n >= 5;
- * Đây đúng là lỗi mà v3.0 đã sửa cho ioOperationsCount nhưng bỏ sót ở đây:
- * bộ đếm chỉ tăng, không bao giờ giảm. Một tiến trình benign sinh file tạm
- * với đuôi lạ (.tmp2, .part, .~lock) chạy đủ lâu sẽ chạm 5 và bật F11.
- *
- * Ransomware khác biệt ở MẬT ĐỘ: 5 file cùng đuôi mới trong 30 giây.
- */
 static bool IsMassNewExtension(ProcessFeature& pf, const std::wstring& ext) {
     if (ext.empty() || ext.size() > 12) return false;
     if (cfg::VALUABLE_EXTS.count(ext) || cfg::EXECUTABLE_EXTS.count(ext)) return false;
-    auto& sc = pf.newExtHistogram[ext];
-    sc.Add();
-    return sc.Count() >= 5;
+
+    // Tăng đếm và lấy số lượng sự kiện trong window
+    pf.newExtHistogram[ext].Add(1);
+    size_t n = pf.newExtHistogram[ext].Count();
+
+    return n >= 5;
 }
 
-/*
- * [FIX 20] F12 KHÔNG CÒN PHỤ THUỘC VÀO VIỆC BACKUP THÀNH CÔNG.
- *
- * Bản cũ chỉ tra FindEntry(): không có bản sao -> không có magicBefore ->
- * F12 câm, dù file bị mã hoá rành rành. Mà backup trượt ở rất nhiều đường
- * bình thường (size_too_big, quota_frozen, sharing violation).
- *
- * Giờ ưu tiên entry (đã có sẵn), thiếu thì lấy từ bảng pre-metadata mà
- * CowEngine chụp cho MỌI file được pend.
- */
 static bool CheckFingerprint(ProcessFeature& pf, const std::wstring& path) {
-    std::string before;
-
-    if (const BackupEntry* e = g_Cow->FindEntry(pf, path))
-        before = e->magicBefore;
-
-    if (before.empty()) {
-        CowEngine::PreMeta pm;
-        if (g_Cow->FindPreMeta(path, pm)) before = pm.magicHex;
-    }
-    if (before.empty()) return false;
+    const BackupEntry* e = g_Cow->FindEntry(pf, path);
+    if (!e || e->magicBefore.empty()) return false;
 
     std::string now = FileMagicHex(path);
-    if (now.empty() || now == before) return false;
+    if (now.empty() || now == e->magicBefore) return false;
 
     LOG_D("      F12: magic %s -> %s  (%s)",
-        before.substr(0, 8).c_str(), now.substr(0, 8).c_str(),
+        e->magicBefore.substr(0, 8).c_str(), now.substr(0, 8).c_str(),
         ws2s(GetFileNameOnly(path)).c_str());
     return true;
 }
@@ -827,6 +794,14 @@ static ULONG OnEvent(const RW_EVENT& ev) {
         return RwReplyContinue;
     }
     if (ev.Action == RwActionProcessExit) {
+        /* [FIX 22] Danh dau exited TRUOC khi Cleanup dong vao — cot `exited`
+           trong CSV la mot trong nhung tin hieu manh nhat (mau ransomware
+           thuong tu thoat sau khi ma hoa xong). */
+        {
+            std::lock_guard<std::mutex> lk(g_Mtx);
+            auto it = g_Collector.find(ev.Pid);
+            if (it != g_Collector.end()) it->second.exited = true;
+        }
         g_Clean->OnProcessExit(ev.Pid);
         return RwReplyContinue;
     }
@@ -889,24 +864,15 @@ static ULONG OnEvent(const RW_EVENT& ev) {
 
         bool ok = g_Cow->OnFirstTouch(pid, path, root, ev.DirEntryCount);
 
-        /* [FIX 24-R] Đếm CoW theo tiến trình — phải RẺ.
-           KHÔNG dùng EnsurePf ở đây: nó gọi GetProcessStartTime +
-           GetProcessImagePath khi tạo mới, tức là hai lần truy vấn tiến trình
-           ngay trong đường pend. Chỉ đụng vào map, để EnsurePf ở nơi khác lo
-           phần khởi tạo. */
-        {
-            std::lock_guard<std::mutex> lk(g_Mtx);
-            auto& rpf = g_Collector[root];
-            rpf.cowFiles++;
-            if (!ok) rpf.cowFailed++;
-        }
-
         TriggerVerdict(root);
 
         if (!ok) {
             g_CowFail++;
             int score = ScoreOf(root);
-            if (score >= cfg::SCORE_FREEZE) {
+            /* [FIX 21] Che do quan sat KHONG DENY: mau nhan ACCESS_DENIED se
+               doi hanh vi (retry / bo file / thoat som) -> feature thu duoc
+               khong giong luc chay that. */
+            if (score >= cfg::SCORE_FREEZE && !g_Observe) {
                 g_CowDeny++;
                 LOG_W("[COW] KHONG CO BAN SAO + score=%d -> DENY IRP: %s",
                     score, ws2s(GetFileNameOnly(path)).c_str());
@@ -989,53 +955,51 @@ static ULONG OnEvent(const RW_EVENT& ev) {
             if (!pf.f12_fingerprintMismatch.value && CheckFingerprint(childPf, path))
                 pf.Raise(pf.f12_fingerprintMismatch, "F12 dau van tay file khong khop");
 
-            /* [FIX 20] F13 cũng lấy được entropyBefore từ pre-metadata khi
-               không có bản backup. Xem chú thích ở CheckFingerprint. */
-            if (!pf.f13_highEntropy.value) {
-                double hBefore = -1.0;
-
-                if (const BackupEntry* e = g_Cow->FindEntry(childPf, path))
-                    hBefore = e->entropyBefore;
-
-                if (hBefore < 0) {
-                    CowEngine::PreMeta pm;
-                    if (g_Cow->FindPreMeta(path, pm) && pm.valid) hBefore = pm.entropy;
-                }
-
-                if (hBefore >= 0) {
+            /*
+             * [FIX 22] Khi dang thu du lieu (--csv) thi KHONG dung tinh
+             * entropy sau khi latch da bat. entropy_delta_mean / _max /
+             * entropy_samples la bien lien tuc — dong bang chung tai thoi
+             * diem phat hien thi ML gan nhu khong con gi de hoc.
+             * Latch van duoc dung de quyet dinh co Raise() hay khong.
+             */
+            const bool wantEntropy = g_Csv.Enabled() || !pf.f13_highEntropy.value;
+            if (wantEntropy) {
+                const BackupEntry* e = g_Cow->FindEntry(childPf, path);
+                if (e) {
                     double hNow = FileEntropy(path, cfg::ENTROPY_SAMPLE_BYTES);
                     if (hNow > 0) {
-                        double d = hNow - hBefore;
-                        childPf.entropyDelta.Add(d);
-                        if (&pf != &childPf) pf.entropyDelta.Add(d);
+                        double d = hNow - e->entropyBefore;
 
-                        /* [FIX 23] giữ giá trị liên tục cho dataset */
-                        if (d > pf.entropyDeltaMax) pf.entropyDeltaMax = d;
+                        childPf.entropyDelta.Add(d);
                         if (d > childPf.entropyDeltaMax) childPf.entropyDeltaMax = d;
+                        if (&pf != &childPf) {
+                            pf.entropyDelta.Add(d);
+                            if (d > pf.entropyDeltaMax) pf.entropyDeltaMax = d;
+                        }
 
                         bool hit = (d > cfg::ENTROPY_DELTA_THRESHOLD) ||
                             (hNow > cfg::ENTROPY_ABS_THRESHOLD && d > 0.5);
-                        if (hit) {
+                        if (hit && !pf.f13_highEntropy.value) {
                             LOG_D("      F13: H %.2f -> %.2f  (dH=+%.2f)  %s",
-                                hBefore, hNow, d, ws2s(GetFileNameOnly(path)).c_str());
+                                e->entropyBefore, hNow, d, ws2s(GetFileNameOnly(path)).c_str());
                             pf.Raise(pf.f13_highEntropy, "F13 delta entropy cao (ma hoa)");
                         }
                     }
                 }
             }
 
-            /* F14 — Differential Area Analysis (Davies et al., arXiv:2106.14418)
-               [FIX 23-R] GIỮ NGUYÊN điều kiện gốc (!f14 && valuable). Bản
-               v4.5.0 tính lại DAA cả sau khi F14 đã bật để lấy daa_min cho
-               dataset — thêm một lần đọc file trên mỗi write event, làm nặng
-               thêm hàng đợi listener. Giá trị liên tục không đáng để đánh đổi
-               thông lượng: vẫn ghi daaMin, nhưng chỉ ở lần tính duy nhất. */
-            if (!pf.f14_daa.value && cfg::VALUABLE_EXTS.count(ext)) {
-                double daa = DifferentialAreaAnalysis(path);   /* 9999 = khong doc duoc */
-                if (daa < pf.daaMin) pf.daaMin = daa;
-                if (daa < childPf.daaMin) childPf.daaMin = daa;
+            /* F14 — Differential Area Analysis (Davies et al., arXiv:2106.14418) */
+            const bool wantDaa = (g_Csv.Enabled() || !pf.f14_daa.value) &&
+                cfg::VALUABLE_EXTS.count(ext) > 0;
+            if (wantDaa) {
+                double daa = DifferentialAreaAnalysis(path);
 
-                if (daa < cfg::DAA_THRESHOLD) {
+                /* [FIX 22] daaMin truoc gio khong bao gio duoc ghi -> cot
+                   daa_min trong CSV luon trong (sentinel 9999). */
+                if (daa < childPf.daaMin) childPf.daaMin = daa;
+                if (daa < pf.daaMin)      pf.daaMin = daa;
+
+                if (daa < cfg::DAA_THRESHOLD && !pf.f14_daa.value) {
                     LOG_D("      F14: DAA=%.2f Bit-Bytes  %s",
                         daa, ws2s(GetFileNameOnly(path)).c_str());
                     pf.Raise(pf.f14_daa, "F14 DAA: header ngau nhien (ma hoa AES)");
@@ -1043,7 +1007,13 @@ static ULONG OnEvent(const RW_EVENT& ev) {
             }
         }
 
-        if (pf.totalScore >= cfg::SCORE_FREEZE && !pf.backupFrozen)
+        /*
+         * [FIX 21] Che do quan sat KHONG dong bang backup.
+         * backupFrozen o SCORE_FREEZE nghia la tu do khong con BackupEntry
+         * moi, ma ca F12 lan F13 deu goi FindEntry() -> hai feature quan
+         * trong nhat tat dung luc mau bat dau ma hoa manh nhat.
+         */
+        if (pf.totalScore >= cfg::SCORE_FREEZE && !pf.backupFrozen && !g_Observe)
             pf.backupFrozen = true;
 
         if (pf.totalScore >= 4 && pf.totalScore < cfg::SCORE_ML_TRIGGER) {
@@ -1259,8 +1229,9 @@ static void MaintenanceThread() {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         tick++;
 
-        if (g_FeatureExporter.Enabled())
-            g_FeatureExporter.Snapshot(g_Mtx, g_Collector, g_FeatureQuietStride);
+        /* [FIX 20] Chup feature moi giay. Chup duoi lock roi format + ghi
+           NGOAI lock — xem dau FeatureExport.h. */
+        if (g_Csv.Enabled()) g_Csv.Snapshot(g_Mtx, g_Collector, g_CsvStride);
 
         if (tick % cfg::HEARTBEAT_INTERVAL_SEC == 0) CleanupEngine::WriteHeartbeat();
         if (tick % 5 == 0) g_Cow->FlushDirtyManifests();
@@ -1316,6 +1287,14 @@ static void StatusThread() {
             g_EvTotal.load(), g_EvPend.load(), g_EvRead.load(),
             g_CowFail.load(), g_CowDeny.load(), ghost, lateRep, badRep);
 
+        /* [FIX 20] Bao tien do thu du lieu ngay trong dong STATUS. */
+        if (g_Csv.Enabled()) {
+            LOG_I("[STATUS] CSV run_id=%s  da ghi %llu dong%s",
+                g_Csv.RunId().c_str(),
+                (unsigned long long)g_Csv.RowsWritten(),
+                g_Observe.load() ? "  [OBSERVE: khong kill]" : "");
+        }
+
         if (ghost > 0) {
             LOG_E("[STATUS] *** GHOST-MISS=%llu *** getattr tra err=2 cho file CO THAT. "
                 "Doc cac dong [PROBE] de biet nguyen nhan chinh xac.", ghost);
@@ -1328,12 +1307,51 @@ static void StatusThread() {
 }
 
 /* ==========================================================================
+   [FIX 20] THAM SỐ DÒNG LỆNH
+   ========================================================================== */
+static void PrintUsage() {
+    printf("  Tham so:\n");
+    printf("    --csv <duong_dan>      Bat ghi feature ra CSV\n");
+    printf("    --label <chuoi>        Nhan muc run: malware / benign\n");
+    printf("    --target-name <chuoi>  Chuoi con ten file mau -> cot is_target\n");
+    printf("    --run-id <chuoi>       De trong thi tu sinh theo thoi gian\n");
+    printf("    --stride <n>           Tien trinh im lang lay mau moi n tick (mac dinh 10)\n");
+    printf("    --observe              KHONG kill — chay het vong doi de thu feature\n");
+    printf("                           *** CHI CHAY TRONG VM CO SNAPSHOT ***\n\n");
+}
+
+/* ==========================================================================
    MAIN
    ========================================================================== */
 int wmain(int argc, wchar_t** argv) {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+    /* ---------------- Doc tham so ---------------- */
+    std::wstring csvPath, targetName;
+    std::string  label = "unknown", runId;
+    bool         wantHelp = false;
+
+    for (int i = 1; i < argc; i++) {
+        std::wstring a = argv[i];
+        auto nextW = [&](std::wstring& out) { if (i + 1 < argc) out = argv[++i]; };
+        auto nextA = [&](std::string& out) {
+            if (i + 1 < argc) out = ws2s(std::wstring(argv[++i]));
+            };
+
+        if (a == L"--csv")              nextW(csvPath);
+        else if (a == L"--target-name") nextW(targetName);
+        else if (a == L"--label")       nextA(label);
+        else if (a == L"--run-id")      nextA(runId);
+        else if (a == L"--observe")     g_Observe = true;
+        else if (a == L"--stride") {
+            std::wstring v; nextW(v);
+            g_CsvStride = _wtoi(v.c_str());
+            if (g_CsvStride < 1) g_CsvStride = 1;
+        }
+        else if (a == L"--help" || a == L"-h" || a == L"/?") wantHelp = true;
+    }
 
     rw::Logger::I().SetLogFile(GetModuleDir() + L"\\ransomwall.log");
 
@@ -1357,45 +1375,20 @@ int wmain(int argc, wchar_t** argv) {
 #endif
     rw::Logger::I().SetFileLevel(rw::LogLevel::Debug);
 
-    ExportOptions exportOpt = ParseExportOptions(argc, argv);
-    g_CollectOnly = exportOpt.collectOnly;
-
-    if (g_CollectOnly && exportOpt.csvPath.empty()) {
-        LOG_E("--collect-only can --export-csv de luu dataset.");
-        return 2;
-    }
-
-    if (!exportOpt.csvPath.empty()) {
-        g_FeatureQuietStride = exportOpt.quietStride;
-        if (!g_FeatureExporter.Init(exportOpt.csvPath, exportOpt.runId,
-            exportOpt.label, exportOpt.targetName)) {
-            LOG_E("Khong khoi tao duoc feature exporter. Thoat.");
-            return 2;
-        }
-    }
-
     printf("\n");
     printf("  ==========================================\n");
-    printf("        RansomWall v4.4\n");
+    printf("        RansomWall v4.5\n");
     printf("     CoW Engine + 14 Features + ML\n");
-    if (g_CollectOnly) {
-        printf("     *** COLLECT-ONLY: KHONG ML / KHONG KILL ***\n");
-    }
 #if RW_BYPASS_ML
-    else {
-        printf("     *** CHE DO BO QUA ML (score>=%d = KILL) ***\n", cfg::SCORE_ML_TRIGGER);
-    }
+    printf("     *** CHE DO BO QUA ML (score>=%d = KILL) ***\n", cfg::SCORE_ML_TRIGGER);
 #endif
     printf("  ==========================================\n\n");
 
-    if (g_CollectOnly) {
-        LOG_W("[COLLECT] Dang thu dataset: van tinh score va ghi CSV, KHONG goi ML/KHONG kill.");
-    }
+    if (wantHelp) { PrintUsage(); return 0; }
+
 #if RW_BYPASS_ML
-    else {
-        LOG_W("[!] RW_BYPASS_ML=1 — score >= %d se KILL NGAY khong hoi ML.",
-            cfg::SCORE_ML_TRIGGER);
-    }
+    LOG_W("[!] RW_BYPASS_ML=1 — score >= %d se KILL NGAY khong hoi ML.",
+        cfg::SCORE_ML_TRIGGER);
 #endif
 
     BOOL isAdmin = FALSE;
@@ -1413,6 +1406,31 @@ int wmain(int argc, wchar_t** argv) {
         return 1;
     }
     SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
+
+    /* ---------------- [FIX 20] Khoi tao CSV ---------------- */
+    if (!csvPath.empty()) {
+        if (!g_Csv.Init(csvPath, runId, label, targetName)) {
+            LOG_E("[CSV] Init that bai — chay tiep nhung KHONG ghi feature.");
+        }
+        else {
+            LOG_I("[CSV] stride=%d (tien trinh im lang lay mau moi %d tick)",
+                g_CsvStride, g_CsvStride);
+        }
+    }
+    else {
+        LOG_I("[CSV] Khong co --csv -> khong ghi feature. Dung --help de xem tham so.");
+    }
+
+    /* ---------------- [FIX 21] Canh bao che do quan sat ---------------- */
+    if (g_Observe) {
+        LOG_W("[!] ============================================================");
+        LOG_W("[!] --observe: score >= %d se KHONG kill.", cfg::SCORE_ML_TRIGGER);
+        LOG_W("[!] DENY IRP tat. Dong bang backup tat.");
+        LOG_W("[!] KHONG co restore, KHONG co CleanRansomArtifacts.");
+        LOG_W("[!] May sau khi chay la may DA BI MA HOA.");
+        LOG_W("[!] CHI CHAY TRONG VM CO SNAPSHOT — revert sau moi mau.");
+        LOG_W("[!] ============================================================");
+    }
 
     /* [FIX 15] Bắt buộc phải bật TRƯỚC khi có bất kỳ lần kill nào.
        Không có nó, ransomware tự đặt DACL sẽ sống sót (err=5). */
@@ -1466,12 +1484,13 @@ int wmain(int argc, wchar_t** argv) {
     g_Running = false;
     if (g_Filter) g_Filter->Disconnect();
     if (g_Cow)    g_Cow->FlushDirtyManifests();
-    if (g_FeatureExporter.Enabled()) {
-        g_FeatureExporter.Snapshot(g_Mtx, g_Collector, 1);
-        g_FeatureExporter.Close();
-    }
     CleanupEngine::ClearHeartbeat();
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    /* [FIX 20] Dong CSV SAU khi cac thread da dung — Close() se fflush,
+       fclose va dat Read-only. */
+    g_Csv.Close();
+
     CoUninitialize();
     LOG_I("Da thoat.");
     rw::Logger::I().Flush();   /* [FIX 19] xa bo dem dong lap cuoi cung */
