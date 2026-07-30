@@ -1317,7 +1317,9 @@ static void PrintUsage() {
     printf("    --run-id <chuoi>       De trong thi tu sinh theo thoi gian\n");
     printf("    --stride <n>           Tien trinh im lang lay mau moi n tick (mac dinh 10)\n");
     printf("    --observe              KHONG kill — chay het vong doi de thu feature\n");
-    printf("                           *** CHI CHAY TRONG VM CO SNAPSHOT ***\n\n");
+    printf("                           *** CHI CHAY TRONG VM CO SNAPSHOT ***\n");
+    printf("    --stop-file <duong_dan> Dung khi file nay xuat hien, thay vi cho Enter\n");
+    printf("                           (bat buoc khi chay tu harness / khong co console)\n\n");
 }
 
 /* ==========================================================================
@@ -1330,6 +1332,7 @@ int wmain(int argc, wchar_t** argv) {
 
     /* ---------------- Doc tham so ---------------- */
     std::wstring csvPath, targetName;
+    std::wstring stopFile;              /* [FIX 23] */
     std::string  label = "unknown", runId;
     bool         wantHelp = false;
 
@@ -1345,6 +1348,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--label")       nextA(label);
         else if (a == L"--run-id")      nextA(runId);
         else if (a == L"--observe")     g_Observe = true;
+        else if (a == L"--stop-file")   nextW(stopFile);   /* [FIX 23] */
         else if (a == L"--stride") {
             std::wstring v; nextW(v);
             g_CsvStride = _wtoi(v.c_str());
@@ -1477,9 +1481,35 @@ int wmain(int argc, wchar_t** argv) {
     std::thread(StatusThread).detach();
 
     printf("\n");
-    LOG_I("=== RansomWall dang giam sat. Nhan Enter de thoat. ===");
-    printf("\n");
-    (void)getchar();
+    if (stopFile.empty()) {
+        LOG_I("=== RansomWall dang giam sat. Nhan Enter de thoat. ===");
+        printf("\n");
+        (void)getchar();
+    }
+    else {
+        /* ==================================================================
+           [FIX 23] TIN HIEU DUNG BANG FILE
+           ==================================================================
+           Khi duoc goi tu harness (prlctl exec / scheduled task) thi KHONG co
+           console tuong tac: getchar() tra EOF NGAY LAP TUC va tien trinh
+           thoat truoc khi thu duoc bat ky feature nao.
+
+           Harness tao file nay khi muon dung -> Close() cua CSV chay day du
+           (fflush + fclose) thay vi bi taskkill giua duong.
+           ================================================================== */
+        std::error_code ec;
+        fs::remove(stopFile, ec);          /* xoa tin hieu cu neu con */
+        LOG_I("=== RansomWall dang giam sat. Cho tin hieu dung: %s ===",
+            ws2s(stopFile).c_str());
+        printf("\n");
+        while (g_Running) {
+            if (fs::exists(stopFile, ec)) {
+                LOG_I("[STOP] Nhan duoc tin hieu dung.");
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        }
+    }
 
     g_Running = false;
     if (g_Filter) g_Filter->Disconnect();
