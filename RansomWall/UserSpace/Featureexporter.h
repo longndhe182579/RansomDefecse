@@ -198,7 +198,7 @@ namespace rw {
             fwrite(out.data(), 1, out.size(), f_);
             rows_ += batch.size();
             if (++flushCtr_ >= 10) { fflush(f_); flushCtr_ = 0; }
-            fflush(f_);  
+            fflush(f_);
         }
 
         void Close() {

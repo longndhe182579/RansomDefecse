@@ -284,9 +284,31 @@ namespace rw {
                 now - ml.lastCall).count();
             if (ml.callCount == 0) return true;
             if (sinceLast < cfg::ML_MIN_INTERVAL_MS) return false;
+
+            /* ==============================================================
+               [FIX 26] THEO DOI 90 GIAY SAU KHI PHAN BENIGN
+               ==============================================================
+               Phai kiem tra TRUOC if(!vectorDirty) vi sau ML call lan 1:
+                 - vectorDirty bi set false
+                 - F1-F14 da bat het, Raise() khong bao gio set dirty lai
+                 -> neu de vectorDirty chong, retry se bi chan mai mai
+
+               Lich goi lai: +30s / +60s / +90s
+               Muc dich: de cow_files, entropy_delta_mean kip cap nhat
+               truoc khi phan quyet. Voi Rhysida, luc goi lan 1 (t~20s)
+               cow_files=0 va entropy=0 vi CoW chua kip doc xong.
+               Sau 30s CoW da backup ~700 file, entropy co so lieu -> predict
+               chinh xac hon.
+               ============================================================== */
+            if (ml.lastVerdict == Verdict::Benign) {
+                if (sinceLast >= 30000 && ml.callCount == 1) return true;
+                if (sinceLast >= 60000 && ml.callCount == 2) return true;
+                if (sinceLast >= 90000 && ml.callCount == 3) return true;
+            }
+
             if (!ml.vectorDirty) return false;
 
-            /* Chỉ gọi lại khi có bằng chứng MỚI so với lần phán quyết trước */
+            /* Goi lai khi co bang chung MOI so voi lan phan quyet truoc */
             if (totalScore > ml.scoreAtLastCall) return true;
             if (ioOps.Rate() > 2.0 * ml.ioRateAtLastCall && ml.ioRateAtLastCall > 0) return true;
             return false;
@@ -325,6 +347,20 @@ namespace rw {
                 .Bool01("fingerprint_mismatch", f12_fingerprintMismatch.value)
                 .Bool01("high_entropy", f13_highEntropy.value)
                 .Bool01("daa_encrypted", f14_daa.value)
+                .Num("io_rate",            ioOps.Rate())
+                .Num("rename_rate",        renames.Rate())
+                .Num("dirent_rate",        dirEntries.Rate())
+                .Num("entropy_delta_mean", entropyDelta.Mean())
+                .Num("entropy_delta_max",  entropyDeltaMax)
+                .Num("daa_min",            daaMin < 9000.0 ? daaMin : 0.0)
+                .UInt("entropy_samples",   (uint64_t)entropyDelta.n)
+                .UInt("cow_files",         cowFiles)
+                .UInt("cow_failed",        cowFailed)
+                .UInt("affected_ext_count",(uint64_t)affectedExts.size())
+                .Int("new_ext_max",        MaxNewExtCount())
+                .UInt("backup_entries",    (uint64_t)entries.size())
+                .UInt("quota_used",        quotaUsed)
+                .UInt("t_ms",              AgeMs())
                 .End();
             return j.Get();
         }

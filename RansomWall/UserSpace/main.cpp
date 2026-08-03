@@ -80,10 +80,48 @@
 
 using namespace rw;
 
+/* ============================================================
+   [FIX 26] LOG MAU SAC CHO KET QUA ML
+   BENIGN  : chu xanh la sang (10) tren nen den -> de nhan ra "an toan"
+   MALWARE : nhu LOG_A nhung them === border -> bat mat hon
+   ============================================================ */
+static void LogMlBenign(const char* fmt, ...) {
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    SYSTEMTIME st; GetLocalTime(&st);
+    char buf[512]; va_list ap; va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+    SetConsoleTextAttribute(h, FOREGROUND_GREEN | FOREGROUND_INTENSITY);  /* bright green */
+    printf("[%02d:%02d:%02d.%03d] [ML>>] %s\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, buf);
+    SetConsoleTextAttribute(h, 7);
+    fflush(stdout);
+    rw::Logger::I().Log(rw::LogLevel::Info, "[ML>>] %s", buf);
+}
+
+static void LogMlMalware(const char* fmt, ...) {
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    SYSTEMTIME st; GetLocalTime(&st);
+    char buf[512]; va_list ap; va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+    /* Nen do tuoi (0xC0) + chu trang sang (0x0F) = 0xCF */
+    SetConsoleTextAttribute(h, 0xCF);
+    printf("[%02d:%02d:%02d.%03d] [ML!!] !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    printf("[%02d:%02d:%02d.%03d] [ML!!] %s\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, buf);
+    printf("[%02d:%02d:%02d.%03d] [ML!!] !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    SetConsoleTextAttribute(h, 7);
+    fflush(stdout);
+    rw::Logger::I().Log(rw::LogLevel::Alert, "[ML!!] %s", buf);
+}
+
+
+
 /* ==========================================================================
    [TẠM THỜI] BỎ QUA ML
    ========================================================================== */
-#define RW_BYPASS_ML 1
+#define RW_BYPASS_ML 0   /* [FIX 26] Tat bypass — dung LightGBM qua Flask server */
 
    /* ==========================================================================
       TRẠNG THÁI TOÀN CỤC
@@ -376,7 +414,7 @@ static void RunStaticForPid(DWORD pid) {
    XỬ LÝ PHÁN QUYẾT MALWARE
    ========================================================================== */
 static void HandleMalwareVerdict(DWORD pid, double conf) {
-    LOG_A("[KILL] === MALWARE (conf=%.2f) PID=%lu ===", conf, pid);
+    LogMlMalware("MALWARE (conf=%.2f) PID=%lu", conf, pid);
 
     {
         std::vector<DWORD> tree;
@@ -566,13 +604,13 @@ static void CallML(DWORD pid) {
         int curScore = ScoreOf(pid);
 
         if (curScore < cfg::SCORE_FREEZE) {
-            LOG_I("[ML] BENIGN (conf=%.2f) PID=%lu score=%d -> unblock, xoa backup",
+            LogMlBenign("[ML] BENIGN (conf=%.2f) PID=%lu score=%d -> unblock, xoa backup",
                 resp.confidence, pid, curScore);
             if (g_Filter && g_Filter->IsConnected()) g_Filter->UndenyPid(pid);
             g_Clean->OnBenign(pid);
         }
         else {
-            LOG_I("[ML] BENIGN (conf=%.2f) PID=%lu score=%d — GIU BACKUP (score van cao)",
+            LogMlBenign("[ML] BENIGN (conf=%.2f) PID=%lu score=%d — GIU BACKUP (score van cao)",
                 resp.confidence, pid, curScore);
             if (g_Filter && g_Filter->IsConnected()) g_Filter->UndenyPid(pid);
         }
@@ -1303,6 +1341,39 @@ static void StatusThread() {
             LOG_E("[STATUS] *** REPLY-LOI=%llu *** co IRP pend khong duoc tra loi dung. "
                 "CoW dang thung.", badRep);
         }
+
+        /* ==============================================================
+           [FIX 26] GOI LAI ML TU TIMER - KHONG PHU THUOC IRP EVENT
+           ==============================================================
+           Van de: ShouldCallML() chi duoc evaluate khi co IRP event moi.
+           Neu ransomware da xong ma hoa (Cerber, Rhysida sau pha 1) thi
+           khong con IRP -> retry 30/60/90s khong bao gio duoc kich hoat.
+
+           Fix: StatusThread chay moi 20s -> sau moi lan sleep, quet tat ca
+           PID dang theo doi co score >= SCORE_ML_TRIGGER va lastVerdict ==
+           Benign -> goi MaybeCallML() -> ShouldCallML() se kiem tra timer
+           va goi lai ML neu da du 30/60/90s.
+           ============================================================== */
+#if !RW_BYPASS_ML
+        {
+            std::vector<DWORD> toRetry;
+            {
+                std::lock_guard<std::mutex> lk(g_Mtx);
+                for (auto& [pid, pf] : g_Collector) {
+                    if (pf.totalScore >= cfg::SCORE_ML_TRIGGER &&
+                        pf.ml.lastVerdict == Verdict::Benign &&
+                        !pf.ml.inFlight &&
+                        pf.ml.callCount > 0 && pf.ml.callCount < 4) {
+                        toRetry.push_back(pid);
+                    }
+                }
+            }
+            for (DWORD pid : toRetry) {
+                LOG_D("[STATUS] Kiem tra retry ML cho PID=%lu...", pid);
+                MaybeCallML(pid);
+            }
+        }
+#endif
     }
 }
 

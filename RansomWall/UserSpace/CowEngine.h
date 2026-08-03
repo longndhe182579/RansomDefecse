@@ -49,21 +49,6 @@
 #include "Features.h"
 #include <mutex>
 
- /* ===========================================================================
-    RW_PREMETA — công tắc cho metadata trước-ghi (FIX 20)
-    ===========================================================================
-      1 = chụp magic + entropy của bản gốc TẠI CÁC ĐIỂM BAIL, để F12/F13 vẫn
-          hoạt động với file không backup được. Đường thành công không tốn gì.
-      0 = tắt hẳn. Hành vi CoW giống hệt v4.4.
-
-    Nếu nghi ngờ hiệu năng, đặt 0 rồi chạy lại để so sánh. Đây là công tắc
-    được thêm sau khi bản v4.5.0 gọi hàm này trên đường nóng và làm vỡ hàng
-    đợi listener.
-    =========================================================================== */
-#ifndef RW_PREMETA
-#define RW_PREMETA 1
-#endif
-
 namespace rw {
 
     /* ---- BAIL: LỖI THẬT — có dữ liệu bị đe doạ mà không cứu được ---- */
@@ -370,48 +355,6 @@ namespace rw {
         uint64_t GhostMissCount() const { return ghostMiss_.load(); }
 
         /* ==================================================================
-           [FIX 20] METADATA TRƯỚC-GHI, ĐỘC LẬP VỚI BACKUP
-           ==================================================================
-           Chụp cho MỌI file được pend, kể cả file cuối cùng không backup được.
-           Nhờ vậy F12/F13 không còn phụ thuộc vào việc CoW thành công hay không.
-
-           Cố tình KHÔNG dùng lại BackupEntry: entry chỉ tồn tại khi có bản sao
-           thật, còn cái này chỉ cần 4KB + 16 byte đầu.
-           ================================================================== */
-        struct PreMeta {
-            bool        valid = false;
-            std::string magicHex;
-            double      entropy = 0;
-            uint64_t    sizeBytes = 0;
-            uint64_t    capturedAtUnix = 0;
-        };
-
-        bool FindPreMeta(const std::wstring& path, PreMeta& out) {
-#if RW_PREMETA
-            /* Bảng rỗng (trường hợp thường gặp) -> thoát KHÔNG lock.
-               Hàm này bị gọi trên mọi write event, không được phép là
-               điểm nghẽn. */
-            if (preCount_.load(std::memory_order_relaxed) == 0) return false;
-
-            std::lock_guard<std::mutex> lk(preMtx_);
-            auto it = preMeta_.find(ToLower(path));
-            if (it == preMeta_.end()) return false;
-            out = it->second;
-            return true;
-#else
-            (void)path; (void)out;
-            return false;
-#endif
-        }
-
-        size_t PreMetaCount() const { return preCount_.load(); }
-
-        /* [FIX 26] Số lần copy vượt quá nửa ngân sách 200ms của driver.
-           StatusThread in ra để biết trần 512MB có thực tế hay không. */
-        uint64_t SlowCopyCount() const { return slowCopies_.load(); }
-        uint64_t MaxCopyMs()     const { return maxCopyMs_.load(); }
-
-        /* ==================================================================
            OnFirstTouch — điểm vào chính. Gọi khi driver pend IRP.
 
            disposition: NT create disposition từ driver (RW_EVENT.DirEntryCount).
@@ -495,25 +438,7 @@ namespace rw {
             uint64_t size = ((uint64_t)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
             if (size == 0) COW_SKIP("size_zero");
 
-            /* =====================================================================
-               [FIX 20-R] ĐƯỜNG NÓNG KHÔNG ĐƯỢC LÀM GÌ THÊM
-               =====================================================================
-               Bản v4.5 đầu tiên gọi CapturePreMeta NGAY TẠI ĐÂY, cho MỌI file
-               được pend. Đó là một sai lầm: thêm hai lần mở file vào đường có
-               ngân sách 200ms.
-
-               Hậu quả đo được trên WannaCry: hàng đợi IOCP vỡ, gần như mọi IRP
-               timeout, CoW ngừng bảo vệ. Nặng hơn: event chấm điểm (NHÁNH 2)
-               dùng CHUNG 4 thread listener đó, nên nó cũng bị bỏ đói — score
-               không bao giờ tới 6, không kill được.
-
-               Bài học: đường pend chỉ được làm ĐÚNG việc copy. Mọi thứ khác
-               phải nằm ở đường bail (hiếm) hoặc ngoài hàng đợi.
-
-               Pre-metadata giờ chỉ chụp tại các điểm bail — xem BailCapture().
-               ===================================================================== */
-
-               /* ---- Lấy thông tin tiến trình (dưới lock, nhanh) ---- */
+            /* ---- Lấy thông tin tiến trình (dưới lock, nhanh) ---- */
             uint64_t startTime;
             int      score;
             bool     frozen;
@@ -542,7 +467,6 @@ namespace rw {
                 ? cfg::MAX_BACKUP_FILE_SIZE
                 : cfg::MAX_BACKUP_FILE_SIZE_CLEAN;
             if (size > sizeCap) {
-                BailCapture(filePath, size);   /* [FIX 20-R] chỉ ở đường hiếm */
                 LOG_W("[COW-BAIL] %-16s %llu MB > %llu MB (score=%d) %s", "size_too_big",
                     size / 1048576, sizeCap / 1048576, score, ws2s(filePath).c_str());
                 return false;
@@ -557,13 +481,9 @@ namespace rw {
                         LOG_W("[COW] DONG BANG backup PID=%lu (score=%d) — khong xoa gi nua.",
                             pid, score);
                     }
-                    BailCapture(filePath, size);
                     COW_BAIL("quota_frozen");
                 }
-                if (!EvictByValue(pid, size)) {
-                    BailCapture(filePath, size);
-                    COW_BAIL("evict_that_bai");
-                }
+                if (!EvictByValue(pid, size)) COW_BAIL("evict_that_bai");
             }
 
             /* ==============================================================
@@ -583,7 +503,6 @@ namespace rw {
             std::wstring dest = dir + L"\\" + entry.backupName;
 
             DWORD cerr = 0;
-            const uint64_t tCopy0 = GetTickCount64();   /* [FIX 26] đo thời gian copy */
             if (!CopyFileSharedRetry(filePath, dest, &cerr)) {
                 std::error_code ec2; fs::remove(dest, ec2);
 
@@ -603,12 +522,6 @@ namespace rw {
                 }
                 return false;
             }
-
-            /* [FIX 26-R] KHÔNG log mỗi lần copy nữa — LOG_D vẫn ghi ra file
-               (fileLv_ = Debug) dưới mutex chung của Logger, tức là một lần
-               ghi đĩa đồng bộ ngay trong đường pend. Chỉ còn cảnh báo khi
-               thật sự chậm, và có throttle. */
-            NoteCopyTime(size, GetTickCount64() - tCopy0);
 
             /* Phân tích TRÊN BẢN SAO */
             entry.entropyBefore = FileEntropy(dest, cfg::ENTROPY_SAMPLE_BYTES);
@@ -778,74 +691,12 @@ namespace rw {
         }
 
     private:
-        /* ==================================================================
-           [FIX 20-R] Chụp metadata CHỈ Ở ĐƯỜNG BAIL.
-           ==================================================================
-           Gọi ngay trước khi return false ở size_too_big / quota_frozen /
-           evict_that_bai. Ba đường này hiếm, nên hai lần mở file ở đây không
-           ảnh hưởng thông lượng — khác hẳn việc gọi cho mọi file như v4.5.0.
-
-           Đường thành công KHÔNG gọi: entry đã có magicBefore/entropyBefore.
-
-           Đặt RW_PREMETA 0 để tắt hẳn -> hành vi giống hệt v4.4.
-           ================================================================== */
-        void BailCapture(const std::wstring& filePath, uint64_t size) {
-#if RW_PREMETA
-            PreMeta pm;
-            pm.sizeBytes = size;
-            pm.capturedAtUnix = UnixNow();
-            pm.magicHex = FileMagicHex(filePath);
-            pm.entropy = FileEntropy(filePath, cfg::ENTROPY_SAMPLE_BYTES);
-            if (pm.magicHex.empty() && pm.entropy <= 0.0) return;
-            pm.valid = true;
-
-            std::wstring key = ToLower(filePath);
-            std::lock_guard<std::mutex> lk(preMtx_);
-            if (preMeta_.find(key) == preMeta_.end()) {
-                preOrder_.push_back(key);
-                while (preOrder_.size() > kPreMetaMax) {
-                    preMeta_.erase(preOrder_.front());
-                    preOrder_.pop_front();
-                }
-            }
-            preMeta_[key] = pm;
-            preCount_.store(preMeta_.size(), std::memory_order_relaxed);
-#else
-            (void)filePath; (void)size;
-#endif
-        }
-
-        /* [FIX 26-R] Chỉ cảnh báo khi copy chạm nửa ngân sách 200ms, và
-           throttle 5 giây/lần. Không log đường thành công. */
-        void NoteCopyTime(uint64_t size, uint64_t ms) {
-            uint64_t prev = maxCopyMs_.load();
-            while (ms > prev && !maxCopyMs_.compare_exchange_weak(prev, ms)) {}
-            if (ms < 100) return;
-
-            uint64_t n = slowCopies_.fetch_add(1) + 1;
-            Logger::I().LogThrottled(LogLevel::Warn, "cow_slow", 5000,
-                "[COW-TIME] copy %llu KB mat %llu ms — ngan sach driver 200ms "
-                "(da cham %llu lan, max %llu ms)",
-                size / 1024, ms, n, maxCopyMs_.load());
-        }
-
         std::mutex& mtx_;
         std::map<DWORD, ProcessFeature>& coll_;
         DiskBudget  budget_;
         std::mutex  dedupMtx_;
         std::map<std::string, std::wstring> dedupIndex_;
         std::atomic<uint64_t> ghostMiss_{ 0 };
-
-        /* [FIX 20-R] bảng metadata trước-ghi, chỉ nạp từ đường bail */
-        static constexpr size_t kPreMetaMax = 20000;
-        std::mutex  preMtx_;
-        std::map<std::wstring, PreMeta> preMeta_;
-        std::deque<std::wstring>        preOrder_;
-        std::atomic<size_t> preCount_{ 0 };
-
-        /* [FIX 26-R] thống kê thời gian copy */
-        std::atomic<uint64_t> slowCopies_{ 0 };
-        std::atomic<uint64_t> maxCopyMs_{ 0 };
 
         static std::wstring TierLabel(int score) {
             return s2ws(TierName(TierOf(score)));
