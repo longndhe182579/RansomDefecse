@@ -1,17 +1,6 @@
 /*
  * Config.h — Mọi hằng số ngưỡng tập trung một chỗ.
  * Sửa ở đây, không rải magic number khắp code.
- *
- * ===========================================================================
- * BẢN VÁ v4.1 — sửa lỗi "có con backup được, có con không"
- * ===========================================================================
- *   [FIX 3] MAX_BACKUP_FILE_SIZE: 50MB -> 512MB, chia 2 bậc theo score.
- *           Chaos wipe file lớn bằng rác; trần 50MB cứng = mất trắng file lớn.
- *   [FIX 4] VALUABLE_EXTS mở rộng mạnh. Driver KHÔNG pend đuôi ngoài danh sách
- *           -> user-space không bao giờ thấy file -> không có cửa nào backup.
- *           DANH SÁCH NÀY PHẢI KHỚP gValuableExts TRONG Driver.c.
- *   [FIX 2] Thêm hằng số retry cho CopyFileShared khi ERROR_SHARING_VIOLATION.
- * ===========================================================================
  */
 #pragma once
 #include <string>
@@ -22,9 +11,9 @@
 namespace rw::cfg {
 
     /* ---------- Chế độ chạy ---------- */
-    // Nếu driver chưa load, chương trình tự chuyển sang SIMULATION
-    // (ReadDirectoryChangesW). Chế độ này KHÔNG pend được -> backup có thể
-    // chậm hơn ransomware. Chỉ dùng để test logic, không phải bảo vệ thật.
+    /* Nếu driver chưa load, chương trình tự chuyển sang SIMULATION
+       (ReadDirectoryChangesW). Chế độ này không pend được IRP nên chỉ dùng
+       để test logic, không phải bảo vệ thật. */
 
     /* ---------- Đường dẫn ---------- */
     inline const std::wstring BACKUP_ROOT = L"C:\\RansomWall_Backup";
@@ -37,47 +26,27 @@ namespace rw::cfg {
     constexpr int SCORE_FREEZE = 2;   // đóng băng backup, tắt LRU
     constexpr int SCORE_CLEANUP_MAX = 1;   // <= giá trị này thì early cleanup được phép
 
-    /* ======================================================================
-       [FIX 3] CoW: trần kích thước file backup — HAI BẬC
-       ======================================================================
-       Trần 50MB cứng của v4.0 là nguyên nhân mất trắng file lớn:
-       Chaos (và các biến thể wiper) GHI ĐÈ file lớn bằng rác thay vì mã hoá.
-       File > 50MB rơi vào COW_BAIL("size_too_big") -> không có bản sao nào.
-
-       Bậc thấp (score <= 1): giữ 50MB để không phình store vì tiến trình sạch.
-       Bậc cao (score >= SCORE_FREEZE): đã nghi ngờ -> nới lên 512MB, cứu được
-       gì thì cứu. Quota động (TIER0..TIER3) vẫn là hàng rào chặn phình.
-       ====================================================================== */
+    /* CoW: trần kích thước file backup, hai bậc theo score. Trần thấp (50MB)
+       khi tiến trình còn sạch để tránh phình store; trần cao (512MB) khi đã
+       nghi ngờ (score >= SCORE_FREEZE), vì một số wiper ghi đè file lớn bằng
+       rác thay vì mã hoá — trần cứng 50MB sẽ bỏ lỡ hoàn toàn các file đó.
+       Quota động (TIER0..TIER3) vẫn là hàng rào chặn phình dung lượng. */
     constexpr uint64_t MAX_BACKUP_FILE_SIZE = 512ull * 1024 * 1024;   // 512MB — score >= 2
     constexpr uint64_t MAX_BACKUP_FILE_SIZE_CLEAN = 50ull * 1024 * 1024;   //  50MB — score <= 1
 
-    /* ======================================================================
-       [FIX 2] Retry copy khi file bị giữ handle
-       ======================================================================
-       CopyFileShared vẫn fail nếu ransomware mở file với dwShareMode = 0
-       (deny-all). Share mode là thoả thuận HAI CHIỀU — không handle mới nào
-       mở được. Retry ngắn để vượt qua trường hợp file chỉ bị khoá một nhịp.
-
-       NGÂN SÁCH THỜI GIAN: driver timeout 200ms (RW_REPLY_TIMEOUT_100NS).
-       3 lần x 30ms = 90ms — vẫn còn chỗ cho bản thân thao tác copy.
-       KHÔNG được nâng quá tay, vượt 200ms là driver fail-open và file mất.
-       ====================================================================== */
+    /* Retry copy khi file bị giữ handle (ransomware mở file với dwShareMode=0
+       deny-all). Retry ngắn để vượt qua trường hợp file chỉ bị khoá một nhịp.
+       Ngân sách thời gian bị giới hạn bởi driver timeout 200ms
+       (RW_REPLY_TIMEOUT_100NS): 3 lần x 30ms = 90ms, chừa chỗ cho thao tác
+       copy — vượt 200ms là driver fail-open và file mất. */
     constexpr int COW_COPY_RETRY_COUNT = 3;
     constexpr int COW_COPY_RETRY_SLEEP_MS = 30;
 
-    /* ======================================================================
-       [FIX 4] VALUABLE_EXTS — PHẢI KHỚP gValuableExts TRONG Driver.c
-       ======================================================================
-       Driver chỉ pend IRP khi đuôi file nằm trong danh sách. Đuôi ngoài danh
-       sách -> KHÔNG pend -> CoW không bao giờ chạy -> mất file, im lặng.
-
-       Đây là lý do "con này backup được, con kia không": ransomware nào quét
-       đúng bộ đuôi của ta thì ta cứu được; con nào quét rộng hơn thì thủng
-       đúng phần chênh lệch.
-
-       Whitelist đuôi về bản chất là mô hình THUA (ta luôn chạy sau kẻ tấn công).
-       Xem RW_COW_BLACKLIST_MODE trong Driver.c nếu muốn đổi sang blacklist.
-       ====================================================================== */
+    /* VALUABLE_EXTS phải khớp gValuableExts trong Driver.c: driver chỉ pend
+       IRP khi đuôi file nằm trong danh sách này, đuôi ngoài danh sách thì
+       CoW không bao giờ chạy và file mất mà không có cảnh báo. Đây là mô
+       hình whitelist (thua kém blacklist về độ phủ) — xem
+       RW_COW_BLACKLIST_MODE trong Driver.c nếu muốn đổi. */
     inline const std::set<std::wstring> VALUABLE_EXTS = {
         /* --- Tài liệu --- */
         L".doc",  L".docx", L".docm", L".dot",  L".dotx", L".odt",

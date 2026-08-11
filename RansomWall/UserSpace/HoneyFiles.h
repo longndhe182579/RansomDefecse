@@ -1,37 +1,14 @@
 /*
- * HoneyFiles.h — Bẫy (F4).  v4.3
+ * HoneyFiles.h — Bẫy (F4).
  *
- * ===========================================================================
- * BẢN VÁ v4.3 — BỎ FILE_ATTRIBUTE_HIDDEN
- * ===========================================================================
- *   [FIX 9] F4 KHÔNG BAO GIỜ BẮN.
- *
- *           Log thực tế: 100 honey file được tạo, Chaos duyệt qua đúng
- *           Documents\Finance, Documents\Work, Downloads\Archives (có
- *           LEIA-ME.txt ở cả ba), mà honey_modified vẫn = 0.
- *
- *           Nguyên nhân: v4.0 thêm FILE_ATTRIBUTE_HIDDEN để chống dương tính
- *           giả. Nhưng RẤT NHIỀU họ ransomware lọc bỏ file hidden/system khi
- *           enumerate — chúng coi đó là file hệ thống, không đáng mã hoá.
- *           Kết quả: đánh đổi mất luôn feature NHANH NHẤT của cả hệ thống.
- *
- *           Chi phí của việc mất F4 (đo từ log):
- *             21:38:26  ransomware bat dau
- *             21:38:29  score 5  (F9 + F10)
- *             ...43 giay dung yen...
- *             21:39:12  score 6  (F7 — ransomware XOA shadow SAU khi ma hoa)
- *             -> kill MUON 46 giay, file da mat het
- *
- *           Với F4 hoạt động, score chạm 6 ngay giây đầu tiên.
- *
- *           Chống dương tính giả giờ CHỈ dựa vào HONEY_WHITELIST — và whitelist
- *           đang làm tốt việc đó: không có một FP honey nào trong toàn bộ log.
- *
- *   [FIX 9b] Bỏ tên bắt đầu bằng '$'. Ký tự '$' khiến file trông như metadata
- *            NTFS ($MFT, $Recycle.Bin) — thêm một lý do nữa để ransomware bỏ qua.
- *            Đổi sang '!' và '_': vẫn đứng đầu danh sách sắp xếp, nhưng trông
- *            như file người dùng bình thường.
- * ===========================================================================
+ * Honey file dùng FILE_ATTRIBUTE_HIDDEN để giảm khả năng người dùng thật vô
+ * tình mở/sửa chúng. Đánh đổi đã biết (ghi nhận từ log thực nghiệm với mẫu
+ * Chaos): một số họ ransomware bỏ qua file hidden/system khi enumerate mục
+ * tiêu, nên F4 có thể không bắn với các họ đó — hệ thống vẫn phát hiện được
+ * qua F9–F14 (hành vi duyệt/ghi/mã hoá hàng loạt), chỉ chậm hơn honey trap.
+ * Tên vẫn bắt đầu bằng '!'/'_' thay vì '$' (trông như metadata NTFS,
+ * $MFT/$Recycle.Bin, dễ bị bỏ qua) để không cộng thêm lý do bị lọc.
+ * Chống dương tính giả dựa vào HONEY_WHITELIST (Config.h).
  */
 #pragma once
 
@@ -64,11 +41,8 @@ namespace rw {
             }
 
             /*
-             * [FIX 9b] Tên bắt đầu bằng '!' hoặc '_' và có cả tên bình thường:
-             * ransomware duyệt thư mục theo thứ tự nào cũng chạm honey sớm.
-             *
-             * KHÔNG dùng '$' — trông như metadata NTFS ($MFT, $Recycle.Bin),
-             * ransomware bỏ qua.
+             * Tên bắt đầu bằng '!'/'_' và cả tên file bình thường: ransomware
+             * duyệt thư mục theo thứ tự nào cũng chạm honey sớm.
              */
             const std::pair<const wchar_t*, const char*> files[] = {
                 { L"\\!!_Important_Passwords.txt",  "Username: admin\nPassword: P@ssw0rd123\nBank PIN: 4471\n" },
@@ -88,17 +62,10 @@ namespace rw {
                 for (const auto& [name, content] : files) {
                     std::wstring full = dir + name;
 
-                    /*
-                     * [FIX 9] FILE_ATTRIBUTE_NORMAL, KHÔNG PHẢI HIDDEN.
-                     *
-                     * Honey file PHẢI trông y hệt file thật thì ransomware mới
-                     * chạm vào. Hidden = vô hình với chính kẻ ta muốn bẫy.
-                     *
-                     * Chống FP: HONEY_WHITELIST trong Config.h (explorer,
-                     * SearchIndexer, MsMpEng...). Đó mới là hàng rào đúng chỗ.
-                     */
+                    /* Hidden để tránh người dùng thật vô tình chạm vào —
+                       xem đánh đổi ở đầu file. */
                     HANDLE h = CreateFileW(full.c_str(), GENERIC_WRITE, 0, nullptr,
-                        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                        CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, nullptr);
                     if (h == INVALID_HANDLE_VALUE) continue;
                     DWORD w = 0;
                     WriteFile(h, content, (DWORD)strlen(content), &w, nullptr);
@@ -109,23 +76,16 @@ namespace rw {
                     list_.insert(ToLower(full));
                 }
             }
-            LOG_I("[HONEY] Da tao %zu honey file trong %zu thu muc (KHONG hidden — "
-                "de ransomware nhin thay).", list_.size(), dirs.size());
+            LOG_I("[HONEY] Da tao %zu honey file (hidden) trong %zu thu muc.",
+                list_.size(), dirs.size());
         }
 
         bool IsHoney(const std::wstring& path) const {
             return list_.count(ToLower(path)) > 0;
         }
 
-        /*
-         * Whitelist — tiến trình hệ thống chạm honey file KHÔNG bị tính điểm.
-         *
-         * ĐÂY là hàng rào chống dương tính giả DUY NHẤT kể từ v4.3 (không còn
-         * dựa vào HIDDEN nữa). Log cho thấy nó làm tốt: không có FP honey nào.
-         *
-         * Nếu sau khi bỏ HIDDEN mà thấy FP, hãy THÊM tiến trình vào
-         * cfg::HONEY_WHITELIST — ĐỪNG bật lại HIDDEN.
-         */
+        /* Tiến trình hệ thống (explorer, SearchIndexer, MsMpEng...) chạm
+           honey file thì không bị tính điểm — chống dương tính giả. */
         static bool IsWhitelisted(DWORD pid) {
             std::wstring n = GetProcessName(pid);
             return cfg::HONEY_WHITELIST.count(n) > 0;

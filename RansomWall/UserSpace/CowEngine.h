@@ -1,46 +1,31 @@
 /*
- * CowEngine.h — Copy-on-Write engine.  v4.3
+ * CowEngine.h — Copy-on-Write engine.
  *
  * NGUYÊN LÝ 1: Backup từ file ĐẦU TIÊN bị chạm. Không chờ điểm, không chờ ML.
  * NGUYÊN LÝ 2: CoW không có nhánh nào đi xuống ML. Nó backup rồi KẾT THÚC.
  *
- * ===========================================================================
- * BẢN VÁ v4.3 — PROBE CHẨN ĐOÁN err=2
- * ===========================================================================
- *   [FIX 10] v4.2 coi MỌI err=2 là "file chưa tồn tại, không có gì để cứu"
- *            rồi im lặng bỏ qua. ĐÓ LÀ CHẨN ĐOÁN SAI.
+ * Khi GetFileAttributesExW trả về ERROR_FILE_NOT_FOUND lúc pend, không được
+ * vội kết luận "file chưa tồn tại, không có gì để cứu": trên máy test luôn
+ * được revert về snapshot sạch trước mỗi lần chạy, nên có trường hợp file
+ * (ví dụ các file .7z/.zip/.csv/.db/.obj trong Downloads, Documents, Desktop)
+ * ĐANG TỒN TẠI lúc ta pend nhưng getattr vẫn báo không thấy — đúng những file
+ * này là file đã bị mã hoá, tức là một lỗ hổng thật khiến backup bị bỏ lọt.
+ * Tương quan quan sát được: cùng một file, ở disposition=OVERWRITE_IF thì
+ * backup thành công, còn ở disposition=CREATE thì getattr báo not-found —
+ * cho thấy lỗi nằm ở phía xử lý đường dẫn/timing, không phải file thực sự
+ * biến mất.
  *
- *            Máy test LUÔN được revert về snapshot sạch trước mỗi lần chạy.
- *            Nghĩa là các file sau ĐANG TỒN TẠI lúc ta pend, mà
- *            GetFileAttributesExW vẫn trả ERROR_FILE_NOT_FOUND:
+ * Vì vậy khi gặp err=2, CoW chạy thêm PROBE (xem ProbeMissingFile) với ba
+ * phép thử độc lập để xác nhận file có thật hay getattr chỉ báo sai:
+ *   altPrefix : thử lại với \\?\  -> đường dẫn dài / ký tự lạ
+ *   findFirst : FindFirstFileW    -> file có thật không
+ *   rawLen    : độ dài chuỗi      -> có ký tự rác ở cuối không
+ * Bảng đọc log [PROBE] để quyết định hướng sửa nằm ở cuối file.
  *
- *              disp=3  Downloads\By_Family (1).7z
- *              disp=3  Downloads\Ransomware.WannaCry.zip
- *              disp=3  Documents\SILRAD-dataset\fasttext-*.csv   (3 file)
- *              disp=3  Desktop\files\...\crypto.db
- *              disp=3  Desktop\files\obj\Debug\RansomWall\main.obj
- *              disp=3  Desktop\files\.vs\...\Browse.VC.db
- *
- *            Đúng 8 file này là những file bị mã hoá. Đây là LỖ HỔNG THẬT
- *            và là lý do backup chỉ được 1 file.
- *
- *            Tương quan rất sạch: Browse.VC.db với disp=5 thì backup THÀNH
- *            CÔNG, cùng file đó ở đường dẫn khác với disp=3 thì FAIL.
- *
- *            Khối PROBE bên dưới chạy 3 phép thử để khoanh nguyên nhân:
- *              altPrefix : thử lại với \\?\  -> đường dẫn dài / ký tự lạ
- *              findFirst : FindFirstFileW    -> file có thật không
- *              rawLen    : độ dài chuỗi      -> có ký tự rác ở cuối không
- *
- *            ĐỌC LOG [PROBE] ĐỂ QUYẾT ĐỊNH BƯỚC TIẾP THEO — xem bảng ở cuối file.
- *
- * ===========================================================================
- * BẢN VÁ CŨ (giữ nguyên)
- * ===========================================================================
- *   [FIX 1] CopyFileShared thay CopyFileW (err=32 sharing violation).
- *   [FIX 2] Retry khi khoá tạm thời.
- *   [FIX 3] Trần kích thước 2 bậc theo score.
- * ===========================================================================
+ * CopyFileShared thay hoàn toàn CopyFileW vì CopyFileW dùng share mode hạn
+ * chế nên hay lỗi err=32 (sharing violation) khi tiến trình khác đang giữ
+ * file mở; CopyFileSharedRetry retry thêm khi gặp khoá tạm thời; kích thước
+ * backup tối đa được chia hai bậc theo điểm nghi ngờ của tiến trình.
  */
 #pragma once
 
@@ -59,11 +44,8 @@ namespace rw {
 #define COW_SKIP(r) do { LOG_D("[COW-SKIP] %-16s %s", r, \
         ws2s(filePath).c_str()); return true;  } while(0)
 
-    /* ======================================================================
-       NT CREATE DISPOSITION — để phân biệt "file mới" với "file phải tồn tại"
-       ======================================================================
-       Driver gửi lên qua RW_EVENT.DirEntryCount (mượn field).
-       ====================================================================== */
+    /* NT CREATE DISPOSITION — phân biệt "file mới" với "file phải tồn tại".
+       Driver gửi lên qua RW_EVENT.DirEntryCount (mượn field). */
     enum : DWORD {
         RW_DISP_SUPERSEDE = 0,   /* thay thế — file có thể đã tồn tại */
         RW_DISP_OPEN = 1,   /* PHẢI tồn tại */
@@ -92,9 +74,7 @@ namespace rw {
         return "?";
     }
 
-    /* ======================================================================
-       DISK BUDGET
-       ====================================================================== */
+    /* ---- Disk budget ---- */
     struct DiskBudget {
         uint64_t freeBytes = 0;
         uint64_t capacityBytes = 0;
@@ -123,9 +103,7 @@ namespace rw {
         }
     };
 
-    /* ======================================================================
-       COPY VỚI SHARE MODE ĐẦY ĐỦ — THAY HOÀN TOÀN CopyFileW
-       ====================================================================== */
+    /* ---- Copy với share mode đầy đủ, thay hoàn toàn CopyFileW ---- */
     inline bool CopyFileShared(const std::wstring& src, const std::wstring& dst,
         DWORD* lastErr = nullptr) {
         HANDLE hSrc = CreateFileW(
@@ -146,7 +124,7 @@ namespace rw {
             return false;
         }
 
-        std::vector<uint8_t> buf(1 << 20);   /* block 1MB */
+        std::vector<uint8_t> buf(1 << 20);
         bool ok = true;
         for (;;) {
             DWORD got = 0;
@@ -154,7 +132,7 @@ namespace rw {
                 if (lastErr) *lastErr = GetLastError();
                 ok = false; break;
             }
-            if (got == 0) break;   /* EOF */
+            if (got == 0) break;
             DWORD off = 0;
             while (off < got) {
                 DWORD wrote = 0;
@@ -173,11 +151,8 @@ namespace rw {
         return ok;
     }
 
-    /* ======================================================================
-       CopyFileSharedRetry — vượt qua khoá TẠM THỜI
-       ======================================================================
-       NGÂN SÁCH: driver timeout 200ms. 3 x 30ms = 90ms.
-       ====================================================================== */
+    /* CopyFileSharedRetry — vượt qua khoá tạm thời. Ngân sách thời gian:
+       driver timeout 200ms, ở đây dùng tối đa 3 lần x 30ms = 90ms. */
     inline bool CopyFileSharedRetry(const std::wstring& src, const std::wstring& dst,
         DWORD* lastErr = nullptr) {
         DWORD err = 0;
@@ -196,15 +171,11 @@ namespace rw {
         return false;
     }
 
-    /* ======================================================================
-       [FIX 10] PROBE — chẩn đoán khi getattr trả err=2
-       ======================================================================
-       Ba phép thử độc lập, chạy NGOÀI đường nóng của file bình thường
-       (chỉ chạy khi đã gặp err=2, tức hiếm).
-
-       Trả về true nếu một trong các cách thay thế TÌM THẤY file — nghĩa là
-       file CÓ THẬT và lỗi nằm ở phía ta (đường dẫn), không phải ở đĩa.
-       ====================================================================== */
+    /* PROBE — chẩn đoán khi getattr trả err=2. Ba phép thử độc lập, chỉ chạy
+       khi đã gặp err=2 (hiếm) nên không ảnh hưởng đường nóng của file bình
+       thường. Trả về true nếu một trong các cách thay thế TÌM THẤY file —
+       nghĩa là file CÓ THẬT và lỗi nằm ở phía ta (đường dẫn), không phải ở
+       đĩa. */
     struct ProbeResult {
         bool altPrefixOk = false;   /* \\?\ prefix mở được */
         bool findFirstOk = false;   /* FindFirstFileW thấy */
@@ -237,9 +208,7 @@ namespace rw {
         return r;
     }
 
-    /* ======================================================================
-       QUOTA ĐỘNG
-       ====================================================================== */
+    /* ---- Quota động ---- */
     inline uint64_t QuotaFor(QuotaTier tier, const DiskBudget& b) {
         switch (tier) {
         case QuotaTier::T0_Clean:
@@ -254,9 +223,7 @@ namespace rw {
         return 0;
     }
 
-    /* ======================================================================
-       V(f) = 3*A + 2*P + 2*R - 4*J     (mục 4.1.4)
-       ====================================================================== */
+    /* V(f) = 3*A + 2*P + 2*R - 4*J     (mục 4.1.4) */
     struct ValueScorer {
         static double Age(const std::wstring& path) {
             WIN32_FILE_ATTRIBUTE_DATA fad{};
@@ -329,9 +296,7 @@ namespace rw {
         }
     };
 
-    /* ======================================================================
-       COW ENGINE
-       ====================================================================== */
+    /* ---- CoW Engine ---- */
     class CowEngine {
     public:
         explicit CowEngine(std::mutex& collectorMutex,
@@ -354,21 +319,20 @@ namespace rw {
         /* Đếm số lần getattr err=2 mà PROBE khẳng định file CÓ THẬT */
         uint64_t GhostMissCount() const { return ghostMiss_.load(); }
 
-        /* ==================================================================
-           OnFirstTouch — điểm vào chính. Gọi khi driver pend IRP.
+        /* OnFirstTouch — điểm vào chính. Gọi khi driver pend IRP.
 
            disposition: NT create disposition từ driver (RW_EVENT.DirEntryCount).
                         Dùng để phân biệt "file mới hợp lệ" với "file đáng lẽ
                         phải tồn tại". RW_DISP_UNKNOWN nếu không có.
 
-           TRẢ VỀ:
-             true  = không có gì đang bị đe doạ (đã backup, hoặc không có gì để cứu)
-             false = CÓ dữ liệu bị đe doạ mà KHÔNG cứu được -> người gọi xử lý
-           ================================================================== */
+           Trả về true nếu không có gì đang bị đe doạ (đã backup, hoặc không
+           có gì để cứu); false nếu có dữ liệu bị đe doạ mà không cứu được
+           -> người gọi phải xử lý. */
         bool OnFirstTouch(DWORD pid, const std::wstring& filePath,
             DWORD rootPid = 0, DWORD disposition = RW_DISP_UNKNOWN) {
-            /* [FIX 19] Bo [COW-IN]: trung thong tin voi [COW-PEND] o main.cpp
-               (cung pid, cung disp, cung ten file) — moi file pend tao 2 dong. */
+            /* Không log [COW-IN] riêng ở đây vì trùng thông tin với
+               [COW-PEND] ở main.cpp (cùng pid, cùng disp, cùng tên file) —
+               mỗi file pend chỉ nên tạo một dòng log. */
 
             if (budget_.belowReserve) COW_BAIL("below_reserve");
             if (filePath.empty())     return true;
@@ -383,10 +347,8 @@ namespace rw {
                 DWORD e = GetLastError();
 
                 if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) {
-                    /* =====================================================
-                       [FIX 10] KHÔNG kết luận vội "file chưa tồn tại".
-                       Chạy PROBE trước.
-                       ===================================================== */
+                    /* Không kết luận vội "file chưa tồn tại" — chạy PROBE
+                       trước (xem giải thích ở đầu file). */
                     ProbeResult pr = ProbeMissingFile(filePath);
                     bool reallyExists = pr.altPrefixOk || pr.findFirstOk || pr.shortPathOk;
 
@@ -408,22 +370,14 @@ namespace rw {
                         return false;   /* <<< LỖI THẬT, báo cho người gọi */
                     }
 
-                    /* =====================================================
-                       [FIX 14] KHÔNG cách nào thấy file -> ĐÚNG LÀ CHƯA TỒN TẠI.
-                       =====================================================
-                       v4.3 coi disp=OPEN / OPEN_IF trên file không tồn tại là
-                       THẤT BẠI. Sai.
-
-                       FILE_OPEN trên đường dẫn chưa có là thao tác KIỂM TRA
-                       TỒN TẠI hoàn toàn bình thường — ransomware làm vậy trước
-                       khi tạo ransom note.
-
-                       Đo được trong log Akira: 15/15 lần cow-fail đều là
-                       akira_readme.txt, và cả 15 đều bị DENY IRP vô nghĩa.
-                       Không một file nạn nhân nào trong số đó.
-
-                       Không có dữ liệu nào bị đe doạ -> return true.
-                       ===================================================== */
+                    /* Không cách nào thấy file -> đúng là chưa tồn tại.
+                       disp=OPEN/OPEN_IF trên đường dẫn chưa tồn tại không
+                       phải lỗi: đó là thao tác kiểm tra tồn tại hoàn toàn
+                       bình thường (ransomware hay làm vậy trước khi tạo
+                       ransom note). Kiểm chứng qua log Akira: toàn bộ 15
+                       lần cow-fail dạng này đều là akira_readme.txt bị
+                       DENY IRP vô hại, không có file nạn nhân nào trong đó.
+                       Không có dữ liệu bị đe doạ -> return true. */
                     LOG_D("[COW-SKIP] %-16s disp=%s %s", "file_moi",
                         DispName(disposition), ws2s(filePath).c_str());
                     return true;
@@ -486,9 +440,7 @@ namespace rw {
                 if (!EvictByValue(pid, size)) COW_BAIL("evict_that_bai");
             }
 
-            /* ==============================================================
-               COPY BYTE GỐC NGAY LẬP TỨC
-               ============================================================== */
+            /* ---- Copy byte gốc ngay lập tức ---- */
             BackupEntry entry;
             entry.originalPath = filePath;
             entry.sizeBytes = size;
@@ -587,9 +539,7 @@ namespace rw {
             return true;
         }
 
-        /* ==================================================================
-           LRU theo GIÁ TRỊ — chỉ chạy khi score <= 1
-           ================================================================== */
+        /* LRU theo giá trị — chỉ chạy khi score <= 1 */
         bool EvictByValue(DWORD pid, uint64_t needBytes) {
             std::lock_guard<std::mutex> lk(mtx_);
             auto& pf = coll_[pid];
@@ -625,7 +575,6 @@ namespace rw {
             return true;
         }
 
-        /* ================================================================== */
         static std::wstring ProcDir(DWORD pid, uint64_t startTime) {
             return cfg::BACKUP_ROOT + L"\\" + MakeProcKey(pid, startTime);
         }
@@ -716,9 +665,7 @@ namespace rw {
         }
     };
 
-    /* ==========================================================================
-       ĐỌC LOG [PROBE] — BẢNG QUYẾT ĐỊNH
-       ==========================================================================
+    /* Đọc log [PROBE] — bảng quyết định:
          alt=1                  -> Đường dẫn dài / ký tự đặc biệt.
                                    SỬA: luôn thêm prefix \\?\ trước mọi lời gọi
                                    Win32 file API trong CoW.
@@ -735,19 +682,15 @@ namespace rw {
                                    ở nguồn (chưa làm).
 
        Không có dòng [PROBE] nào -> mọi err=2 đều là file mới thật, CoW đang
-       hoạt động đúng và lỗ hổng nằm chỗ khác.
-       ========================================================================== */
+       hoạt động đúng và lỗ hổng nằm chỗ khác. */
 
-       /* ==========================================================================
-          VIỆC CÒN LẠI
-          ==========================================================================
+       /* Việc còn lại:
           1. FirstTouch bị TIÊU THỤ dù backup thất bại. PreCreate gọi FtTestAndSet
              TRƯỚC khi biết user-space cứu được không -> IRP_MJ_WRITE sau đó không
              pend nữa. Cần RwReplyRetryLater để driver nhả slot.
 
           2. Copy user-space không vượt được share mode deny-all. Cách dứt điểm:
              FltCreateFileEx2(... IO_IGNORE_SHARE_ACCESS_CHECK ...) + FltReadFile
-             trong kernel.
-          ========================================================================== */
+             trong kernel. */
 
 } // namespace rw

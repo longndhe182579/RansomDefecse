@@ -1,45 +1,25 @@
 /*
- * Driver.c — RansomWall Kernel Minifilter v4.4
+ * Driver.c — RansomWall Kernel Minifilter
  *
- * ===========================================================================
- * BẢN VÁ v4.4 — BẮT THAO TÁC MỞ ĐỌC
- * ===========================================================================
- *   [FIX 11] Chaos KHÔNG ghi đè file gốc. Bằng chứng từ log + đĩa:
+ * Chỉ hook thao tác GHI (write/rename/delete) là không đủ: một số họ
+ * ransomware không ghi đè file gốc mà mở file CHỈ ĐỌC, mã hoá trong bộ nhớ,
+ * ghi ra file mới với đuôi ngẫu nhiên (vd "RansomWall.pdb" -> "*.1bnp") rồi
+ * xoá file gốc. Bước tạo file mới đi qua nhánh FILE_CREATE (được thả ngay vì
+ * không có gì để cứu/bẫy), nên toàn bộ chuỗi này nằm ngoài tầm hook ghi và
+ * honey file không bao giờ bị chạm tới.
  *
- *              RansomWall.pdb  ->  RansomWall.pdb.1bnp
- *              (nối thêm đuôi ngẫu nhiên 4 ký tự vào SAU tên gốc đầy đủ)
+ * Vì vậy PreCreate còn gửi thêm event RwActionRead khi phát hiện mở đọc file
+ * giá trị, dùng để user-space kiểm honey file và đếm mật độ I/O (không dùng
+ * để backup — đọc không phá dữ liệu nên không cần backup). Event này KHÔNG
+ * PEND (FltSendMessage với WaitReply = FALSE): IRP không bị chặn, không
+ * round-trip chờ user-space, chi phí chỉ là băng thông message chứ không
+ * phải độ trễ I/O. Nó dùng key FirstTouch riêng (XOR RW_READ_MARK) để không
+ * đụng slot FirstTouch của thao tác ghi theo sau trên cùng file.
  *
- *            Chuỗi hành động:
- *              1. Mở file gốc CHỈ ĐỌC        <- PreCreate cũ: !wantsWrite -> THẢ
- *              2. Mã hoá trong bộ nhớ
- *              3. Tạo file mới "<goc>.1bnp"  <- FILE_CREATE -> THẢ (đúng)
- *              4. Xoá file gốc
- *
- *            Toàn bộ nằm NGOÀI tầm hook cũ. Log 3 lần chạy không có MỘT event
- *            rename (act=2) hay delete (act=3) nào. Honey file không bao giờ
- *            bị chạm vì ta chỉ hook thao tác GHI.
- *
- *            SỬA: gửi event RwActionRead khi mở đọc file giá trị.
- *
- *            QUAN TRỌNG — event này KHÔNG PEND:
- *              - FltSendMessage với WaitReply = FALSE
- *              - IRP không bị chặn, không round-trip 200ms
- *              - Chi phí chỉ là băng thông message, không phải độ trễ I/O
- *
- *            Mục đích DUY NHẤT: user-space kiểm honey file (F4) và đếm mật
- *            độ I/O. KHÔNG dùng để backup — honey file không cần backup, và
- *            file thường thì đọc không phá dữ liệu.
- *
- *            Key FirstTouch riêng (XOR RW_READ_MARK) để không ăn mất slot
- *            pend của thao tác ghi sau đó.
- *
- * ===========================================================================
- * BẢN VÁ CŨ (giữ nguyên)
- * ===========================================================================
- *   [FIX 4] gValuableExts 141 đuôi, khớp cfg::VALUABLE_EXTS.
- *   [FIX 5] Key FirstTouchTable thống nhất PathHash64.
- *   [FIX 6] Bỏ DbgPrint flood.
- *   [FIX 8] Shell là điểm dừng của chuỗi RootPid.
+ * gValuableExts PHẢI khớp cfg::VALUABLE_EXTS trong Config.h. Chuỗi cha-con
+ * dùng để tính RootPid dừng lại tại các tiến trình shell (xem IsShellImage)
+ * vì tiến trình con sinh ra từ shell không nên bị gộp vào cùng gốc với các
+ * tiến trình khác mà shell từng sinh ra trước đó.
  *
  * CẢNH BÁO:
  *   - CHỈ chạy trong VM. Lỗi kernel = BSOD, không phải exception.
@@ -56,32 +36,23 @@
 #pragma prefast(disable:__WARNING_ENCODE_MEMBER_FUNCTION_POINTER, "Not valid for kernel mode drivers")
 
  /*
-  * ===========================================================================
-  * RW_COW_BLACKLIST_MODE — TUỲ CHỌN, MẶC ĐỊNH TẮT
-  * ===========================================================================
-  * Whitelist đuôi file là mô hình THUA: đuôi ngẫu nhiên của Chaos (.1bnp)
-  * không nằm trong danh sách nên bước 3 và 4 đều vô hình.
-  *
-  * Bật cờ này để pend MỌI đuôi TRỪ file thực thi -> F11 (IsMassNewExtension)
-  * bắt được "cùng một đuôi lạ trên >= 5 file" và cộng điểm sớm.
-  *
-  * ĐÁNH ĐỔI: tải I/O tăng đáng kể. ĐỪNG bật cùng lúc với FIX 11 ở lần đo
-  * đầu tiên — máy lag thì không biết cái nào gây ra.
-  * ===========================================================================
+  * RW_COW_BLACKLIST_MODE (tuỳ chọn, mặc định tắt): whitelist đuôi file là
+  * mô hình thua trước đuôi file ngẫu nhiên — đuôi lạ không nằm trong danh
+  * sách nên các bước tạo/xoá file mới đều vô hình với whitelist. Bật cờ này
+  * để pend MỌI đuôi TRỪ file thực thi, giúp IsMassNewExtension bắt được
+  * "cùng một đuôi lạ xuất hiện trên nhiều file" và cộng điểm sớm hơn. Đánh
+  * đổi: tải I/O tăng đáng kể, nên đo tách biệt với việc bật theo dõi mở đọc
+  * để không nhầm lẫn nguyên nhân gây lag.
   */
 #define RW_COW_BLACKLIST_MODE 0
 
-  /*
-   * [FIX 11] Bật/tắt event mở đọc. Đặt 0 nếu cần loại trừ nguyên nhân lag.
-   */
+  /* Bật/tắt event mở đọc; đặt 0 nếu cần loại trừ nguyên nhân gây lag. */
 #define RW_TRACK_READ_OPEN 1
 
    /* Marker XOR để tách không gian key đọc khỏi key ghi */
 #define RW_READ_MARK 0x5245414400000000LL   /* "READ" */
 
-   /* ==========================================================================
-      GLOBALS
-      ========================================================================== */
+/* ---- Globals ---- */
 
 typedef struct _RW_GLOBALS {
     PFLT_FILTER     Filter;
@@ -100,9 +71,7 @@ RW_GLOBALS gRw = { 0 };
 
 static BOOLEAN PathContainsCI(PCUNICODE_STRING Path, PCWSTR Needle);   /* fwd decl */
 
-/* --------------------------------------------------------------------------
-   FirstTouchTable — hash table (PID, Key) -> đã chạm chưa
-   -------------------------------------------------------------------------- */
+/* ---- FirstTouchTable: hash table (PID, Key) -> đã chạm chưa ---- */
 #define FT_BUCKETS 1024
 
 typedef struct _FT_ENTRY {
@@ -157,6 +126,25 @@ static BOOLEAN FtTestAndSet(ULONG Pid, LONGLONG FileRef) {
     return isFirst;
 }
 
+/* Nhả lại MỘT slot First Touch — dùng khi backup thất bại nhưng IRP vẫn
+   được cho đi tiếp (RwCmdClearTouch), để lần ghi kế tiếp vào đúng file
+   được pend lại thay vì mất bảo vệ vĩnh viễn cho hết vòng đời tiến trình. */
+static VOID FtRemoveEntry(ULONG Pid, LONGLONG FileRef) {
+    ULONG idx = FtHash(Pid, FileRef);
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&gFtLock, &oldIrql);
+    for (PLIST_ENTRY e = gFtBucket[idx].Flink; e != &gFtBucket[idx]; e = e->Flink) {
+        PFT_ENTRY entry = CONTAINING_RECORD(e, FT_ENTRY, Link);
+        if (entry->Pid == Pid && entry->FileRef == FileRef) {
+            RemoveEntryList(e);
+            KeReleaseSpinLock(&gFtLock, oldIrql);
+            ExFreePoolWithTag(entry, RW_TAG);
+            return;
+        }
+    }
+    KeReleaseSpinLock(&gFtLock, oldIrql);
+}
+
 static VOID FtRemovePid(ULONG Pid) {
     KIRQL oldIrql;
     KeAcquireSpinLock(&gFtLock, &oldIrql);
@@ -187,9 +175,7 @@ static VOID FtFlushAll(VOID) {
     KeReleaseSpinLock(&gFtLock, oldIrql);
 }
 
-/* ==========================================================================
-   PROCESS TREE — Pid -> RootPid   ([FIX 8] shell là điểm dừng)
-   ========================================================================== */
+/* ---- Process tree: Pid -> RootPid (chuỗi dừng tại tiến trình shell) ---- */
 #define PT_BUCKETS 256
 
 typedef struct _PT_ENTRY {
@@ -311,9 +297,7 @@ static VOID PtFlushAll(VOID) {
     KeReleaseSpinLock(&gPtLock, oldIrql);
 }
 
-/* --------------------------------------------------------------------------
-   Denied PID list
-   -------------------------------------------------------------------------- */
+/* ---- Denied PID list ---- */
 #define MAX_DENIED 64
 ULONG      gDenied[MAX_DENIED] = { 0 };
 KSPIN_LOCK gDeniedLock;
@@ -338,9 +322,7 @@ static VOID RemoveDenied(ULONG Pid) {
     KeReleaseSpinLock(&gDeniedLock, o);
 }
 
-/* ==========================================================================
-   BỘ LỌC TRƯỚC KHI PEND
-   ========================================================================== */
+/* ---- Bộ lọc trước khi pend ---- */
 
 static const PCWSTR gSkipDirs[] = {
     L"\\WINDOWS\\",
@@ -439,9 +421,7 @@ static BOOLEAN IsValuableExt(PCUNICODE_STRING Path) {
 #endif
 }
 
-/* ==========================================================================
-   PATH BLACKLIST (H1)
-   ========================================================================== */
+/* ---- Path blacklist (H1) ---- */
 static const PCWSTR gBlacklist[] = {
     L"\\WINDOWS\\SYSTEM32\\",
     L"\\WINDOWS\\SYSWOW64\\",
@@ -499,9 +479,7 @@ static BOOLEAN IsTrustedProcess(VOID) {
     return trusted;
 }
 
-/* ==========================================================================
-   GỬI EVENT LÊN USER-SPACE
-   ========================================================================== */
+/* ---- Gửi event lên user-space ---- */
 static NTSTATUS SendEvent(PRW_EVENT Ev, BOOLEAN WaitReply, PULONG ReplyCode) {
     if (gRw.ClientPort == NULL) return STATUS_PORT_DISCONNECTED;
     if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
@@ -554,12 +532,11 @@ static BOOLEAN FillFileInfo(PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltOb
     return TRUE;
 }
 
-/* ==========================================================================
-   CORE: xử lý chung cho Write / Rename / Delete
-   ========================================================================== */
+/* ---- Core: xử lý chung cho Write / Rename / Delete ---- */
 
 static FLT_PREOP_CALLBACK_STATUS HandleMutation(
-    PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, ULONG Action)
+    PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, ULONG Action,
+    PVOID* CompletionContext)
 {
     ULONG pid = (ULONG)(ULONG_PTR)PsGetCurrentProcessId();
 
@@ -621,7 +598,18 @@ static FLT_PREOP_CALLBACK_STATUS HandleMutation(
             Data->IoStatus.Information = 0;
             return FLT_PREOP_COMPLETE;
         }
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+
+        /*
+         * Đánh dấu để PostMutation gửi thêm MỘT event ASYNC sau khi ghi
+         * THẬT SỰ hoàn tất -> Nhánh 2 (F10-F14) ở user-space có cơ hội
+         * kiểm tra fingerprint/entropy/DAA cho đúng LẦN GHI ĐẦU TIÊN.
+         * Không đánh dấu thì lần ghi đầu tiên (chính lúc nội dung bị mã
+         * hoá) chỉ được backup rồi bỏ qua hoàn toàn, không đặc trưng động
+         * nào được tính cho nó — ransomware ghi mỗi file đúng một lần sẽ
+         * gần như tàng hình trước F10-F14.
+         */
+        *CompletionContext = (PVOID)(ULONG_PTR)1;
+        return FLT_PREOP_SUCCESS_WITH_CALLBACK;
     }
 
     ev.IsPending = 0;
@@ -632,16 +620,67 @@ static FLT_PREOP_CALLBACK_STATUS HandleMutation(
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
 }
 
-/* ==========================================================================
-   PRE-CREATE
-   ==========================================================================
-   Hai đường:
-     A. MỞ GHI / phá huỷ  -> PEND, chờ user-space backup (như cũ)
-     B. MỞ ĐỌC  [FIX 11]  -> gửi event KHÔNG PEND, chỉ để bắt honey + đếm I/O
+/*
+ * PostMutation — chạy sau khi thao tác ghi/rename ĐÃ HOÀN TẤT thật sự trên
+ * đĩa, CHỈ khi HandleMutation đã đánh dấu CompletionContext (đúng lần First
+ * Touch bị pend). Gửi thêm một event ASYNC mang đúng nội dung SAU khi ghi,
+ * để Nhánh 2 ở user-space có dữ liệu so sánh — xem giải thích ở HandleMutation.
+ */
+FLT_POSTOP_CALLBACK_STATUS PostMutation(
+    _Inout_ PFLT_CALLBACK_DATA Data, _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_opt_ PVOID CompletionContext, _In_ FLT_POST_OPERATION_FLAGS Flags)
+{
+    if (CompletionContext == NULL) return FLT_POSTOP_FINISHED_PROCESSING;
+    if (FlagOn(Flags, FLTFL_POST_OPERATION_DRAINING)) return FLT_POSTOP_FINISHED_PROCESSING;
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) return FLT_POSTOP_FINISHED_PROCESSING;
+    if (!NT_SUCCESS(Data->IoStatus.Status)) return FLT_POSTOP_FINISHED_PROCESSING;
 
-   Đường B là thứ bắt được Chaos: nó đọc file gốc rồi ghi ra file mới, nên
-   đường A không bao giờ thấy gì.
-   ========================================================================== */
+    ULONG pid = (ULONG)(ULONG_PTR)PsGetCurrentProcessId();
+    if (pid == gRw.SelfPid) return FLT_POSTOP_FINISHED_PROCESSING;
+    if (PtIsRwDescendant(pid)) return FLT_POSTOP_FINISHED_PROCESSING;
+
+    ULONG action;
+    ULONG major = Data->Iopb->MajorFunction;
+    if (major == IRP_MJ_WRITE) {
+        action = RwActionWrite;
+    }
+    else if (major == IRP_MJ_SET_INFORMATION) {
+        switch (Data->Iopb->Parameters.SetFileInformation.FileInformationClass) {
+        case FileRenameInformation:
+        case FileRenameInformationEx:
+            action = RwActionRename; break;
+        default:
+            /* Delete/Truncate: Nhánh 2 (main.cpp) không dùng tới, bỏ qua */
+            return FLT_POSTOP_FINISHED_PROCESSING;
+        }
+    }
+    else {
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    }
+
+    RW_EVENT ev = { 0 };
+    PUNICODE_STRING name = NULL;
+    PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
+    if (!FillFileInfo(Data, FltObjects, &ev, &name, &nameInfo))
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    FltReleaseFileNameInformation(nameInfo);
+
+    ev.Pid = pid;
+    ev.RootPid = PtGetRoot(pid);
+    ev.Action = action;
+    ev.IsPending = 0;
+    ev.IsFirstTouch = 0;
+
+    SendEvent(&ev, FALSE, NULL);
+    return FLT_POSTOP_FINISHED_PROCESSING;
+}
+
+/*
+ * PreCreate xử lý hai đường: (A) mở ghi / phá huỷ -> pend, chờ user-space
+ * backup; (B) mở đọc -> gửi event không pend, chỉ để bắt honey file và đếm
+ * mật độ I/O. Đường B là thứ bắt được kiểu ransomware đọc file gốc rồi ghi
+ * ra file mới thay vì ghi đè — trường hợp đó đường A không bao giờ thấy gì.
+ */
 FLT_PREOP_CALLBACK_STATUS PreCreate(
     _Inout_ PFLT_CALLBACK_DATA Data, _In_ PCFLT_RELATED_OBJECTS FltObjects,
     _Flt_CompletionContext_Outptr_ PVOID* CompletionContext)
@@ -672,7 +711,7 @@ FLT_PREOP_CALLBACK_STATUS PreCreate(
         FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | GENERIC_WRITE | GENERIC_ALL)
         ? TRUE : FALSE;
 
-    /* [FIX 11] Mở ĐỌC — Chaos dùng đường này để lấy nội dung gốc */
+    /* Mở đọc — kiểu tấn công đọc-file-gốc-rồi-ghi-ra-file-mới dùng đường này */
     BOOLEAN wantsRead = FlagOn(acc, FILE_READ_DATA | GENERIC_READ) ? TRUE : FALSE;
 
     BOOLEAN writePath = (destructive || delOnClose || wantsWrite);
@@ -705,9 +744,7 @@ FLT_PREOP_CALLBACK_STATUS PreCreate(
 
     LONGLONG key = PathHash64(&nameInfo->Name);
 
-    /* ==================================================================
-       ĐƯỜNG B — MỞ ĐỌC. KHÔNG PEND, KHÔNG CHẶN IRP.
-       ================================================================== */
+    /* ---- Đường B: mở đọc — không pend, không chặn IRP ---- */
 #if RW_TRACK_READ_OPEN
     if (!writePath) {
         /* Key riêng để không ăn mất slot pend của thao tác GHI sau này */
@@ -735,9 +772,7 @@ FLT_PREOP_CALLBACK_STATUS PreCreate(
     }
 #endif
 
-    /* ==================================================================
-       ĐƯỜNG A — MỞ GHI / PHÁ HUỶ. PEND, chờ user-space backup.
-       ================================================================== */
+    /* ---- Đường A: mở ghi / phá huỷ — pend, chờ user-space backup ---- */
     BOOLEAN isFirst = FtTestAndSet(pid, key);
 
 #ifdef RW_VERBOSE_TRACE
@@ -778,16 +813,13 @@ FLT_PREOP_CALLBACK_STATUS PreWrite(
     _Inout_ PFLT_CALLBACK_DATA Data, _In_ PCFLT_RELATED_OBJECTS FltObjects,
     _Flt_CompletionContext_Outptr_ PVOID* CompletionContext)
 {
-    UNREFERENCED_PARAMETER(CompletionContext);
-    return HandleMutation(Data, FltObjects, RwActionWrite);
+    return HandleMutation(Data, FltObjects, RwActionWrite, CompletionContext);
 }
 
 FLT_PREOP_CALLBACK_STATUS PreSetInformation(
     _Inout_ PFLT_CALLBACK_DATA Data, _In_ PCFLT_RELATED_OBJECTS FltObjects,
     _Flt_CompletionContext_Outptr_ PVOID* CompletionContext)
 {
-    UNREFERENCED_PARAMETER(CompletionContext);
-
     FILE_INFORMATION_CLASS cls = Data->Iopb->Parameters.SetFileInformation.FileInformationClass;
     ULONG action;
 
@@ -804,7 +836,7 @@ FLT_PREOP_CALLBACK_STATUS PreSetInformation(
     default:
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
-    return HandleMutation(Data, FltObjects, action);
+    return HandleMutation(Data, FltObjects, action, CompletionContext);
 }
 
 /* PostDirectoryControl — nguồn dữ liệu THẬT cho F9 */
@@ -863,9 +895,7 @@ FLT_POSTOP_CALLBACK_STATUS PostDirectoryControl(
     return FLT_POSTOP_FINISHED_PROCESSING;
 }
 
-/* ==========================================================================
-   PROCESS NOTIFY — RootPid + command line (F6, F7)
-   ========================================================================== */
+/* ---- Process notify: RootPid + command line (F6, F7) ---- */
 VOID ProcessNotify(
     _Inout_ PEPROCESS Process, _In_ HANDLE ProcessId,
     _Inout_opt_ PPS_CREATE_NOTIFY_INFO CreateInfo)
@@ -909,9 +939,7 @@ VOID ProcessNotify(
     if (KeGetCurrentIrql() == PASSIVE_LEVEL) SendEvent(&ev, FALSE, NULL);
 }
 
-/* ==========================================================================
-   REGISTRY CALLBACK — F8
-   ========================================================================== */
+/* ---- Registry callback (F8) ---- */
 static BOOLEAN IsPersistenceKey(PCUNICODE_STRING Key, PCUNICODE_STRING ValueName) {
 
     if (PathContainsCI(Key, L"\\SERVICES\\BAM\\"))      return FALSE;
@@ -971,9 +999,7 @@ NTSTATUS RegistryCallback(_In_ PVOID CallbackContext, _In_opt_ PVOID Argument1,
     return STATUS_SUCCESS;
 }
 
-/* ==========================================================================
-   COMMUNICATION PORT
-   ========================================================================== */
+/* ---- Communication port ---- */
 NTSTATUS PortConnect(_In_ PFLT_PORT ClientPort, _In_opt_ PVOID ServerPortCookie,
     _In_reads_bytes_opt_(SizeOfContext) PVOID ConnectionContext,
     _In_ ULONG SizeOfContext, _Outptr_result_maybenull_ PVOID* ConnectionCookie)
@@ -1018,14 +1044,13 @@ NTSTATUS PortMessage(_In_opt_ PVOID PortCookie,
     case RwCmdUndenyPid:   RemoveDenied(cmd.Pid);  break;
     case RwCmdPauseCow:    gRw.CowPaused = TRUE;   FtFlushAll(); break;
     case RwCmdResumeCow:   gRw.CowPaused = FALSE;  break;
+    case RwCmdClearTouch:  FtRemoveEntry(cmd.Pid, cmd.FileRef); break;
     default: return STATUS_INVALID_PARAMETER;
     }
     return STATUS_SUCCESS;
 }
 
-/* ==========================================================================
-   FILTER REGISTRATION
-   ========================================================================== */
+/* ---- Filter registration ---- */
 NTSTATUS InstanceSetup(_In_ PCFLT_RELATED_OBJECTS FltObjects,
     _In_ FLT_INSTANCE_SETUP_FLAGS Flags,
     _In_ DEVICE_TYPE VolumeDeviceType,
@@ -1056,8 +1081,8 @@ NTSTATUS FilterUnload(_In_ FLT_FILTER_UNLOAD_FLAGS Flags) {
 
 CONST FLT_OPERATION_REGISTRATION Callbacks[] = {
     { IRP_MJ_CREATE,            0, PreCreate,          NULL },
-    { IRP_MJ_WRITE,             0, PreWrite,           NULL },
-    { IRP_MJ_SET_INFORMATION,   0, PreSetInformation,  NULL },
+    { IRP_MJ_WRITE,             0, PreWrite,           PostMutation },
+    { IRP_MJ_SET_INFORMATION,   0, PreSetInformation,  PostMutation },
     { IRP_MJ_DIRECTORY_CONTROL, 0, NULL,               PostDirectoryControl },
     { IRP_MJ_OPERATION_END }
 };

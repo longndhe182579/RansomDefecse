@@ -1,37 +1,20 @@
 /*
  * Features.h — Cấu trúc dữ liệu đặc trưng.
  *
- * SỬA LỖI v3.0:
- *   - Điểm chỉ tăng, không bao giờ giảm  -> Latch một chiều (không decay)
- *   - Counter tích luỹ (ioOperationsCount > 3) -> SlidingCounter theo TỐC ĐỘ
- *   - FeatureCollector phình vô hạn      -> có GC
- *   - aiCalled một chiều                 -> MLState cho phép tái đánh giá
- *
- * ===========================================================================
- * BẢN VÁ v4.5
- * ===========================================================================
- *   [FIX 22] newExtHistogram TÍCH LUỸ VÔ HẠN — đúng lỗi đã sửa cho
- *            ioOperationsCount ở v3.0 nhưng bỏ sót chỗ này.
- *            std::map<wstring,int> chỉ ++ mà không bao giờ trừ, ngưỡng n>=5
- *            là tổng tuyệt đối. Tiến trình benign chạy vài giờ sẽ chạm.
- *            -> Đổi sang map<wstring, SlidingCounter>, đếm theo cửa sổ 30s.
- *
- *   [FIX 23] LƯU GIÁ TRỊ LIÊN TỤC, không chỉ boolean.
- *            daaMin và entropyDeltaMax trước đây bị tính rồi vứt đi ngay sau
- *            khi nhị phân hoá thành F13/F14. Với 14 boolean thì không gian
- *            đặc trưng chỉ có 2^14 điểm và các cột tương quan mạnh — quá
- *            mỏng để train. Giữ lại số gốc cho ToTrainingJson().
- *
- *   [FIX 24] cowFiles / cowFailed — đếm CoW có chạy được cho tiến trình này
- *            không. BẮT BUỘC phải có trong dataset: F12/F13 chỉ bật được khi
- *            tồn tại metadata trước-ghi, nên F13=0 mang HAI nghĩa khác nhau
- *            ("không mã hoá" và "không có gì để so sánh"). Không tách được
- *            hai nghĩa đó thì model sẽ học nhầm F13 thành "CoW có chạy không".
- *
- *   [FIX 25] ToJson() bổ sung root_pid / process_start_time / total_score.
- *            Trường "pid" GIỮ NGUYÊN để không phá Flask hiện có, nhưng lưu ý:
- *            giá trị trong đó vốn đã là rootPid (CallML được gọi với root).
- * ===========================================================================
+ * Nguyên tắc thiết kế:
+ *   - Điểm chỉ tăng, không bao giờ giảm (Latch một chiều, không decay).
+ *   - Đếm theo TỐC ĐỘ (SlidingCounter) thay vì tổng tích luỹ vô hạn, kể cả
+ *     cho newExtHistogram — một map cộng dồn mãi mãi sẽ khiến tiến trình
+ *     benign chạy đủ lâu cũng vượt ngưỡng.
+ *   - Lưu lại giá trị liên tục (daaMin, entropyDeltaMax...) thay vì chỉ giữ
+ *     boolean sau khi nhị phân hoá: 14 cột boolean chỉ có 2^14 điểm và tương
+ *     quan mạnh với nhau — quá mỏng để train tốt.
+ *   - cowFiles/cowFailed bắt buộc có trong dataset: F12/F13 chỉ bật được khi
+ *     tồn tại metadata trước-ghi, nên F13=0 mang hai nghĩa khác nhau ("không
+ *     mã hoá" và "không có gì để so sánh") — thiếu cột này model sẽ học nhầm
+ *     F13 thành "CoW có chạy không".
+ *   - MLState cho phép gọi lại ML khi có bằng chứng mới, thay vì cờ một
+ *     chiều "đã gọi rồi thì thôi".
  */
 #pragma once
 
@@ -42,19 +25,17 @@
 
 namespace rw {
 
-    /* ======================================================================
-       LATCH — cờ một chiều, chỉ bật không tắt
-       ======================================================================
-       KHÔNG thêm decay vào đây. Lý do đo được từ log Chaos:
-           21:38:29  score 5  (F9 + F10)
-           ...43 giay dung yen...
-           21:39:12  score 6  (F7)
-       Nếu F9/F10 hết hạn sau 30s thì score tụt về 3 và KHÔNG BAO GIỜ chạm 6
-       -> không kill. Latch một chiều là lý do hệ thống bắt được Chaos.
-
-       Muốn biết "feature có đang active trong cửa sổ hiện tại không" thì dùng
-       ActiveNow() — dựa vào setAt, không đụng vào giá trị latch.
-       ====================================================================== */
+    /*
+     * LATCH — cờ một chiều, chỉ bật không tắt.
+     *
+     * Không decay: nếu một cờ tự hết hạn sau WINDOW_SEC, tổng điểm có thể
+     * tụt xuống dưới ngưỡng kill trong lúc ransomware tạm dừng hoạt động
+     * (I/O) giữa hai giai đoạn tấn công, khiến hệ thống bỏ lỡ điểm kill.
+     * Latch một chiều đảm bảo bằng chứng đã thấy không bao giờ bị quên.
+     *
+     * Muốn biết "feature có đang active trong cửa sổ hiện tại không" thì dùng
+     * ActiveNow() — dựa vào setAt, không đụng vào giá trị latch.
+     */
     struct Latch {
         bool      value = false;
         TimePoint setAt{};
@@ -65,21 +46,20 @@ namespace rw {
         explicit operator bool() const { return value; }
     };
 
-    /* [FIX 23] Feature có bật TRONG cửa sổ WINDOW_SEC gần nhất không.
-       Chỉ dùng để EXPORT cho ML — không dùng để chấm điểm/trigger. */
+    /* Feature có bật trong cửa sổ WINDOW_SEC gần nhất không.
+       Chỉ dùng để export cho ML — không dùng để chấm điểm/trigger. */
     inline bool ActiveNow(const Latch& l) {
         if (!l.value) return false;
         return std::chrono::duration_cast<std::chrono::seconds>(
             Clock::now() - l.setAt).count() <= cfg::WINDOW_SEC;
     }
 
-    /* ======================================================================
-       SLIDING COUNTER — đo TỐC ĐỘ, không phải tổng tích luỹ
-       ======================================================================
-       v3.0: ioOperationsCount > 3 (tích luỹ)
-             -> 7-Zip / indexer chạy cả ngày CHẮC CHẮN vượt.
-             Ransomware khác biệt ở MẬT ĐỘ, không phải tổng.
-       ====================================================================== */
+    /*
+     * SLIDING COUNTER — đo tốc độ (event trong cửa sổ WINDOW_SEC gần nhất),
+     * không phải tổng tích luỹ. Đếm tích luỹ khiến tiến trình sạch (7-Zip,
+     * indexer...) chạy đủ lâu cũng vượt ngưỡng; ransomware khác biệt ở mật
+     * độ thao tác, không phải tổng số.
+     */
     struct SlidingCounter {
         std::deque<TimePoint> ev;
 
@@ -109,12 +89,8 @@ namespace rw {
         double Mean() const { return n ? sum / (double)n : 0.0; }
     };
 
-    /* ======================================================================
-       ML STATE — KHÔNG phải cờ một chiều
-       ======================================================================
-       v3.0: if (pf.aiCalled) return;  -> ML sai một lần là sai vĩnh viễn.
-       v4.0: cho gọi lại khi có bằng chứng MỚI.
-       ====================================================================== */
+    /* ML STATE — không phải cờ một chiều: cho gọi lại ML khi có bằng chứng
+       mới, thay vì một lần gọi sai là sai vĩnh viễn. */
     enum class Verdict { Unknown, Benign, Malware };
 
     struct MLState {
@@ -126,16 +102,12 @@ namespace rw {
         bool      vectorDirty = false;
 
         /*
-         * inFlight — CHỐNG STAMPEDE.
-         *
-         * LỖI ĐÃ SỬA (30 luồng ML cùng lúc, 30 lần restore đồng thời):
-         *   MaybeCallML kiểm tra ShouldCallML() rồi spawn thread; việc cập nhật
-         *   lastCall lại nằm BÊN TRONG thread đó. 30 event ập tới trong vài
-         *   micro giây -> tất cả kiểm tra TRƯỚC khi bất kỳ ai cập nhật -> pass hết.
-         *   -> 30 luồng CopyFileW vào CÙNG một đích -> file bị zero (dH=-7.93).
-         *   Code khôi phục tự phá file.
-         *
-         * Phải "giành quyền" NGAY tại điểm kiểm tra, dưới cùng một lock.
+         * inFlight — chống stampede: nếu MaybeCallML chỉ kiểm tra
+         * ShouldCallML() rồi spawn thread, và lastCall chỉ được cập nhật bên
+         * trong thread đó, nhiều event ập tới cùng lúc sẽ đều thấy điều kiện
+         * còn thoả và cùng spawn — nhiều luồng ghi/restore đồng thời vào
+         * cùng một đích sẽ phá lẫn nhau. Phải "giành quyền" ngay tại điểm
+         * kiểm tra, dưới cùng một lock.
          */
         bool      inFlight = false;
 
@@ -143,9 +115,7 @@ namespace rw {
         bool      verdictHandled = false;
     };
 
-    /* ======================================================================
-       QUOTA TIER
-       ====================================================================== */
+    /* ---- Quota tier ---- */
     enum class QuotaTier { T0_Clean, T1_Suspect, T2_Danger, T3_Critical };
 
     inline const char* TierName(QuotaTier t) {
@@ -164,9 +134,7 @@ namespace rw {
         return QuotaTier::T3_Critical;
     }
 
-    /* ======================================================================
-       BACKUP ENTRY — một dòng trong manifest
-       ====================================================================== */
+    /* ---- Backup entry: một dòng trong manifest ---- */
     struct BackupEntry {
         std::wstring backupName;      // 1736938201_report.xlsx
         std::wstring originalPath;    // C:\Users\x\Documents\Finance\report.xlsx
@@ -179,9 +147,6 @@ namespace rw {
         bool         dedupLink = false;
     };
 
-    /* ======================================================================
-       PROCESS FEATURE
-       ====================================================================== */
     struct ProcessFeature {
         DWORD        pid = 0;
         DWORD        rootPid = 0;
@@ -223,16 +188,16 @@ namespace rw {
         std::set<std::wstring> affectedExts;
         RunningMean    entropyDelta;
 
-        /* [FIX 23] Giá trị liên tục — giữ lại thay vì vứt sau khi nhị phân hoá */
+        /* Giá trị liên tục — giữ lại thay vì vứt sau khi nhị phân hoá */
         double       daaMin = 9999.0;   // F14: DAA thấp nhất từng thấy
         double       entropyDeltaMax = 0.0;     // F13: dH lớn nhất từng thấy
 
-        /* [FIX 24] CoW có chạy được cho tiến trình này không */
+        /* CoW có chạy được cho tiến trình này không */
         uint64_t     cowFiles = 0;      // số file pend đã xử lý xong
         uint64_t     cowFailed = 0;     // trong đó bao nhiêu KHÔNG cứu được
 
-        /* ---- Đuôi file mới xuất hiện hàng loạt (F11) ---- */
-        /* [FIX 22] SlidingCounter, KHÔNG phải int tích luỹ */
+        /* Đuôi file mới xuất hiện hàng loạt (F11) — SlidingCounter theo cửa
+           sổ, không phải int tích luỹ vô hạn */
         std::map<std::wstring, SlidingCounter> newExtHistogram;
 
         /* ---- CoW state ---- */
@@ -259,7 +224,7 @@ namespace rw {
             return false;
         }
 
-        /* [FIX 22] Số lần xuất hiện của đuôi mới "nóng" nhất TRONG CỬA SỔ.
+        /* Số lần xuất hiện của đuôi mới "nóng" nhất trong cửa sổ.
            Tiện thể dọn các đuôi đã nguội để map không phình theo thời gian. */
         int MaxNewExtCount() {
             int mx = 0;
@@ -285,21 +250,15 @@ namespace rw {
             if (ml.callCount == 0) return true;
             if (sinceLast < cfg::ML_MIN_INTERVAL_MS) return false;
 
-            /* ==============================================================
-               [FIX 26] THEO DOI 90 GIAY SAU KHI PHAN BENIGN
-               ==============================================================
-               Phai kiem tra TRUOC if(!vectorDirty) vi sau ML call lan 1:
-                 - vectorDirty bi set false
-                 - F1-F14 da bat het, Raise() khong bao gio set dirty lai
-                 -> neu de vectorDirty chong, retry se bi chan mai mai
-
-               Lich goi lai: +30s / +60s / +90s
-               Muc dich: de cow_files, entropy_delta_mean kip cap nhat
-               truoc khi phan quyet. Voi Rhysida, luc goi lan 1 (t~20s)
-               cow_files=0 va entropy=0 vi CoW chua kip doc xong.
-               Sau 30s CoW da backup ~700 file, entropy co so lieu -> predict
-               chinh xac hon.
-               ============================================================== */
+            /*
+             * Theo dõi 90 giây sau khi ML phán benign, gọi lại ở +30s/+60s/+90s
+             * để cow_files và entropy_delta_mean kịp cập nhật trước khi phán
+             * quyết — ở lần gọi đầu (t~20s) CoW có thể chưa kịp backup đủ file
+             * nên các feature đó vẫn bằng 0. Phải kiểm tra trước
+             * if(!vectorDirty): sau lần gọi ML đầu tiên, F1-F14 thường đã bật
+             * hết nên Raise() không còn cơ hội set dirty lại, nếu để
+             * vectorDirty chặn thì lịch retry này không bao giờ chạy.
+             */
             if (ml.lastVerdict == Verdict::Benign) {
                 if (sinceLast >= 30000 && ml.callCount == 1) return true;
                 if (sinceLast >= 60000 && ml.callCount == 2) return true;
@@ -308,7 +267,7 @@ namespace rw {
 
             if (!ml.vectorDirty) return false;
 
-            /* Goi lai khi co bang chung MOI so voi lan phan quyet truoc */
+            /* Gọi lại khi có bằng chứng mới so với lần phán quyết trước */
             if (totalScore > ml.scoreAtLastCall) return true;
             if (ioOps.Rate() > 2.0 * ml.ioRateAtLastCall && ml.ioRateAtLastCall > 0) return true;
             return false;
@@ -323,9 +282,9 @@ namespace rw {
            F1-F13: Shaukat & Ribeiro, COMSNETS 2018
            F14:    Davies et al., arXiv:2106.14418, 2021 (DAA)
 
-           [FIX 25] Thêm root_pid / process_start_time / total_score cho khớp
-           mô tả 3.1.6 ("gửi kèm để phục vụ truy vết"). Giữ nguyên "pid" để
-           không phá Flask đang chạy. */
+           "pid" giữ nguyên nghĩa cũ (thực chất là rootPid) để không phá
+           tương thích với Flask hiện có; root_pid/process_start_time/
+           total_score gửi kèm riêng để phục vụ truy vết. */
         std::string ToJson() {
             JsonW j;
             j.Begin()
@@ -365,11 +324,9 @@ namespace rw {
             return j.Get();
         }
 
-        /* ==================================================================
-           [FIX 23/24] ToTrainingJson — BẢN GHI DÙNG ĐỂ TRAIN, không phải để
-           suy luận lúc chạy.
-           ==================================================================
-           Khác ToJson() ở ba điểm, và cả ba đều cần thiết:
+        /*
+           ToTrainingJson — bản ghi dùng để train, không phải để suy luận lúc
+           chạy. Khác ToJson() ở ba điểm, và cả ba đều cần thiết:
 
            1. fN_now  — feature có active trong cửa sổ 30 giây hiện tại không.
               Cột fN (latch) trả lời "đã từng", cột fN_now trả lời "đang".
@@ -385,10 +342,9 @@ namespace rw {
               của số 0 bị trộn làm một.
 
            runId do người gọi truyền vào: mỗi phiên chạy mẫu một giá trị, dùng
-           để tách train/test THEO PHIÊN. Nếu hai snapshot cách nhau 1 giây của
-           cùng một lần chạy rơi vào cả train lẫn test thì accuracy sẽ đẹp một
-           cách vô nghĩa.
-           ================================================================== */
+           để tách train/test theo phiên — nếu hai snapshot cách nhau 1 giây
+           của cùng một lần chạy rơi vào cả train lẫn test thì accuracy sẽ
+           đẹp một cách vô nghĩa. */
         std::string ToTrainingJson(const std::string& runId, const char* label) {
             JsonW j;
             j.Begin()

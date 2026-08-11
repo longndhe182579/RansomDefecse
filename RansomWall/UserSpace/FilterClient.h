@@ -1,15 +1,11 @@
 /*
  * FilterClient.h — Giao tiếp với minifilter driver.
  *
- * QUAN TRỌNG: dùng NHIỀU thread listener.
- *
- * Lỗi kiến trúc của v3.0: callback từ driver chạy trên MỘT thread duy nhất,
- * mà TriggerBlockAndAI lại chờ backupDone NGAY TRONG callback đó — trong khi
- * backupDone chỉ được set khi driver gửi notify, mà notify đó phải đi qua
- * chính callback đang bị chặn. Deadlock logic.
- *
- * v4.0: N thread listener, mỗi thread xử lý event độc lập. Driver pend IRP
- * thì thread nào rảnh sẽ nhận và reply. CoW không bao giờ chờ ML.
+ * QUAN TRỌNG: dùng nhiều thread listener, không phải một. Nếu chỉ một thread
+ * nhận callback và cùng thread đó phải chờ một event khác (vd backupDone) mà
+ * event đó chỉ được set khi có notify mới đi qua đúng thread đang bị chặn,
+ * ta có deadlock logic. Với N thread độc lập, thread nào rảnh sẽ nhận và
+ * reply, nên CoW không bao giờ bị chặn chờ ML.
  */
 #pragma once
 
@@ -39,9 +35,7 @@ namespace rw {
 #pragma pack(pop)
 
     /*
-     * ============================================================================
-     * KÍCH THƯỚC REPLY — KHÔNG ĐƯỢC DÙNG sizeof(RwReplyMessage)
-     * ============================================================================
+     * KÍCH THƯỚC REPLY — KHÔNG ĐƯỢC DÙNG sizeof(RwReplyMessage).
      *
      * FILTER_REPLY_HEADER chứa ULONGLONG -> alignment của struct là 8
      * -> sizeof(RwReplyMessage) bị đệm thành 24, KHÔNG phải 20:
@@ -116,6 +110,17 @@ namespace rw {
         bool PauseCow() { return SendCommand(RwCmdPauseCow, 0); }
         bool ResumeCow() { return SendCommand(RwCmdResumeCow, 0); }
 
+        /* Nhả lại slot First Touch của (pid, fileRef) sau khi CoW backup
+           thất bại nhưng IRP vẫn được cho đi tiếp — để lần ghi kế tiếp vào
+           đúng file đó được driver pend lại, có cơ hội backup lại. */
+        bool ClearTouch(ULONG pid, long long fileRef) {
+            if (!connected_) return false;
+            RW_COMMAND cmd{ RwCmdClearTouch, pid, fileRef };
+            DWORD ret = 0;
+            HRESULT hr = FilterSendMessage(port_, &cmd, sizeof(cmd), nullptr, 0, &ret);
+            return SUCCEEDED(hr);
+        }
+
         /*
          * StartListening — tạo pool thread nhận event.
          *
@@ -137,7 +142,7 @@ namespace rw {
             return true;
         }
 
-        /* [FIX 18] Cho StatusThread doc — phan biet loi that voi reply muon */
+        /* Tách riêng để StatusThread phân biệt lỗi thật với reply đến muộn */
         uint64_t ReplyFailCount()  const { return replyFails_.load(); }
         uint64_t LateReplyCount()  const { return lateReplies_.load(); }
 
@@ -153,8 +158,8 @@ namespace rw {
         std::atomic<bool> running_{ false };
         std::atomic<bool> connected_{ false };
         std::atomic<uint64_t> replyFails_{ 0 };
-        /* [FIX 18] Đếm riêng reply đến muộn (0x801F0020) — vô hại, không
-           trộn chung với lỗi thật để khỏi che mất tín hiệu nghiêm trọng. */
+        /* Đếm riêng reply đến muộn (0x801F0020) — vô hại, không trộn chung
+           với lỗi thật để khỏi che mất tín hiệu nghiêm trọng. */
         std::atomic<uint64_t> lateReplies_{ 0 };
         Handler  handler_;
 
@@ -214,24 +219,12 @@ namespace rw {
                     HRESULT hr = FilterReplyMessage(port_, &reply.Header, kReplySize);
 
                     if (FAILED(hr)) {
-                        /* =====================================================
-                           [FIX 18] 0x801F0020 KHÔNG PHẢI LỖI NGHIÊM TRỌNG
-                           =====================================================
-                           ERROR_FLT_NO_WAITER_FOR_REPLY = ta trả lời NHƯNG driver
-                           đã hết chờ 200ms và fail-open cho IRP đi tiếp.
-
-                           Lưu ý: hằng số này ĐÃ là HRESULT sẵn trong winerror.h
-                           (_HRESULT_TYPEDEF_(0x801F0020L)) -> so sánh TRỰC TIẾP,
-                           KHÔNG bọc HRESULT_FROM_WIN32.
-
-                           Bản cũ in "CoW KHONG HOAT DONG ... Khong file nao duoc
-                           backup" cho MỌI lỗi vì dòng đó nằm NGOÀI chuỗi if/else.
-                           Sai ngữ cảnh và gây hoảng: trong log Akira, lỗi này chỉ
-                           xảy ra 1 lần, đúng lúc copy file lớn song song với thao
-                           tác kill — file đó VẪN backup xong bình thường.
-
-                           Đếm riêng, log ở mức WARN, không tính vào replyFails_.
-                           ===================================================== */
+                        /* ERROR_FLT_NO_WAITER_FOR_REPLY: ta trả lời NHƯNG driver
+                           đã hết chờ 200ms và fail-open cho IRP đi tiếp — không
+                           nghiêm trọng, file thường vẫn đã backup xong trước đó.
+                           Hằng số này đã là HRESULT sẵn trong winerror.h nên so
+                           sánh trực tiếp, không bọc HRESULT_FROM_WIN32. Đếm và
+                           log riêng ở mức WARN, không tính vào replyFails_. */
                         if (hr == ERROR_FLT_NO_WAITER_FOR_REPLY) {
                             if (lateReplies_.fetch_add(1) % 50 == 0) {
                                 LOG_W("[FLT] Reply den muon — driver da timeout 200ms cho IRP nay "

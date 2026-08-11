@@ -1,14 +1,13 @@
 /*
  * Cleanup.h — Vòng đời và dọn dẹp backup (mục 4.1.6) + Restore có điều kiện (4.4).
  *
- * BỐN cơ chế độc lập. Thiếu bất kỳ cái nào -> CoW ăn hết ổ đĩa trong vài ngày:
+ * Bốn cơ chế độc lập. Thiếu bất kỳ cái nào thì CoW ăn hết ổ đĩa trong vài
+ * ngày, vì tiến trình sạch (Word/Photoshop/7-Zip...) score thấp không bao
+ * giờ chạm ngưỡng ML nhưng vẫn tạo backup cho hàng nghìn file:
  *   (1) Early cleanup   — tiến trình ĐANG CHẠY, score <= 1
  *   (2) Exit cleanup    — tiến trình THOÁT, có grace period
  *   (3) Verdict cleanup — sau khi ML phán quyết
  *   (4) Orphan sweep    — backup mồ côi sau crash/reboot
- *
- * v3.0 chỉ có (3), mà (3) chỉ dọn cho tiến trình ĐÃ QUA ML — tức đã đạt 6 điểm.
- * Word/Photoshop/7-Zip score 1-3 chạm hàng nghìn file, KHÔNG BAO GIỜ được dọn.
  */
 #pragma once
 
@@ -17,10 +16,33 @@
 #include "Features.h"
 #include "CowEngine.h"
 #include <mutex>
+#include <set>
 
 namespace rw {
 
     enum class CleanupReason { EarlyClean, ProcessExit, BenignVerdict, MalwareVerdict, Orphan };
+
+    /*
+     * Ransom note KHÔNG nằm trong BackupEntry — nó là file MỚI (FILE_CREATE),
+     * mà PreCreate trong Driver.c chủ động bỏ qua nhánh này ("không có gì để
+     * cứu, cũng không có gì để bẫy"), nên hệ thống chưa từng biết đường dẫn
+     * của nó để mà xoá. Nhận diện bằng TÊN FILE thay vì đuôi ransomware đã
+     * biết (CleanRansomArtifacts) — ransom note luôn dùng đuôi thường
+     * (.txt/.html) nên không thể phân biệt bằng đuôi.
+     */
+    inline bool LooksLikeRansomNote(const std::wstring& fileName) {
+        std::wstring low = ToLower(fileName);
+        static const std::vector<std::wstring> kMarkers = {
+            L"decrypt", L"restore-my-files", L"restore_my_files", L"restore-files",
+            L"how_to_decrypt", L"how-to-decrypt", L"recover-files",
+            L"recovery_instructions", L"_readme", L"!!!readme!!!", L"!!read",
+            L"read_it", L"read-me", L"files_encrypted", L"help_decrypt",
+            L"ransom_note", L"your_files",
+        };
+        for (auto& m : kMarkers)
+            if (low.find(m) != std::wstring::npos) return true;
+        return low == L"readme.txt" || low == L"read_me.txt" || low == L"read me.txt";
+    }
 
     inline const char* ReasonName(CleanupReason r) {
         switch (r) {
@@ -39,9 +61,7 @@ namespace rw {
             : mtx_(mtx), coll_(coll), cow_(cow) {
         }
 
-        /* ==================================================================
-           (1) EARLY CLEANUP — ca phổ biến nhất mà v3.0 bỏ sót hoàn toàn
-           ================================================================== */
+        /* ---- (1) Early cleanup ---- */
         void EarlyCleanupPass() {
             std::vector<DWORD> pids;
             {
@@ -99,9 +119,7 @@ namespace rw {
                 pid, pf.totalScore, removed, freed / 1024, pf.entries.size());
         }
 
-        /* ==================================================================
-           (2) EXIT CLEANUP — tiến trình thoát
-           ================================================================== */
+        /* ---- (2) Exit cleanup ---- */
         void OnProcessExit(DWORD pid) {
             std::lock_guard<std::mutex> lk(mtx_);
             auto it = coll_.find(pid);
@@ -151,9 +169,7 @@ namespace rw {
             }
         }
 
-        /* ==================================================================
-           (3) VERDICT CLEANUP
-           ================================================================== */
+        /* ---- (3) Verdict cleanup ---- */
         void OnBenign(DWORD pid) {
             uint64_t st = 0;
             {
@@ -187,9 +203,7 @@ namespace rw {
             else    LOG_I("[CLEAN-3] PID=%lu MALWARE -> quarantine: %s", pid, ws2s(dst).c_str());
         }
 
-        /* ==================================================================
-           (4) ORPHAN SWEEP — chạy MỘT LẦN lúc khởi động
-           ================================================================== */
+        /* ---- (4) Orphan sweep — chạy một lần lúc khởi động ---- */
         void OrphanSweep() {
             bool prevCrashed = fs::exists(cfg::SESSION_FILE);
             if (prevCrashed)
@@ -280,13 +294,12 @@ namespace rw {
             fs::remove(cfg::SESSION_FILE, ec);
         }
 
-        /* ==================================================================
-           RESTORE CÓ ĐIỀU KIỆN (mục 4.4)
-           ==================================================================
-           v3.0 restore đè VÔ ĐIỀU KIỆN. Nếu ML sai và tiến trình bị nghi oan
-           là một editor đang lưu bài hợp lệ, restore sẽ quay ngược file về bản
-           cũ và XOÁ MẤT CÔNG VIỆC THẬT của người dùng.
-           ================================================================== */
+        /*
+         * RESTORE CÓ ĐIỀU KIỆN (mục 4.4) — không đè file vô điều kiện.
+         * Nếu ML phán nhầm và tiến trình bị nghi oan là một editor đang lưu
+         * bài hợp lệ, đè file vô điều kiện sẽ xoá mất công việc thật của
+         * người dùng. Chỉ đè khi có dấu hiệu mã hoá rõ ràng (xem dưới).
+         */
         struct RestoreStats { int overwritten = 0, sidelined = 0, skipped = 0, missing = 0; };
 
         RestoreStats RestoreFiles(DWORD pid) {
@@ -352,10 +365,8 @@ namespace rw {
                  *   - Entropy TĂNG mạnh  (dH > +2.0)  — dữ liệu trở nên ngẫu nhiên
                  *   - HOẶC magic byte đổi VÀ entropy cao (> 7.0)
                  *
-                 * LỖI ĐÃ SỬA: điều kiện cũ là "magic đổi" đơn thuần -> đè cả khi
-                 * dH ÂM (dH=-7.93 = file bị zero). File zero cũng có magic khác
-                 * -> restore đè -> nhiều luồng đè chồng -> hỏng thêm.
-                 * Entropy giảm mạnh KHÔNG phải mã hoá; đó là file rỗng/dở dang.
+                 * Chỉ xét "magic đổi" đơn thuần sẽ đè cả khi dH ÂM (file bị
+                 * zero/rỗng): entropy giảm mạnh không phải dấu hiệu mã hoá.
                  */
                 double dH = hNow - e.entropyBefore;
                 bool entropyJump = (dH > cfg::ENTROPY_DELTA_THRESHOLD);
@@ -389,22 +400,18 @@ namespace rw {
             return st;
         }
 
-        /* ==================================================================
-           DỌN FILE RÁC DO RANSOMWARE TẠO RA
-           ==================================================================
-           WannaCry (và phần lớn ransomware) làm 3 bước:
-             1. Đọc  Cleanup.h
-             2. GHI bản mã hoá ra FILE MỚI: Cleanup.h.WNCRY
-             3. XOÁ Cleanup.h
-
-           RestoreFiles khôi phục bước 3 -> Cleanup.h quay lại.
-           Nhưng Cleanup.h.WNCRY KHÔNG AI XOÁ — nó chưa từng là file của user,
-           nên không nằm trong manifest. Kết quả: user thấy CẢ HAI file.
-
-           AN TOÀN: chỉ xoá <original_path> + <đuôi ransomware>, tức đúng những
-           file mà ta BIẾT là sinh ra từ một file trong manifest.
-           Không quét thư mục, không đoán, không đụng gì khác.
-           ================================================================== */
+        /*
+         * DỌN FILE RÁC DO RANSOMWARE TẠO RA.
+         *
+         * WannaCry (và phần lớn ransomware) làm 3 bước: đọc file gốc, ghi bản
+         * mã hoá ra file mới (vd file.docx.WNCRY), rồi xoá file gốc.
+         * RestoreFiles khôi phục được file gốc, nhưng file .WNCRY không ai
+         * xoá — nó chưa từng là file của user nên không nằm trong manifest.
+         *
+         * An toàn: chỉ xoá <original_path> + <đuôi ransomware>, tức đúng
+         * những file biết chắc sinh ra từ một entry trong manifest. Không
+         * quét thư mục, không đoán, không đụng gì khác.
+         */
         int CleanRansomArtifacts(DWORD pid) {
             static const wchar_t* kRansomExts[] = {
                 L".WNCRY", L".WNCRYT", L".wncry", L".wnry", L".wncryt",
@@ -437,6 +444,67 @@ namespace rw {
             }
             if (removed > 0)
                 LOG_I("   [CLEAN] Da xoa %d file rac do ransomware tao ra.", removed);
+            return removed;
+        }
+
+        /*
+         * Dọn ransom note. Chỉ quét các THƯ MỤC đã có ít nhất một BackupEntry
+         * (tức chắc chắn là nạn nhân thật, không quét toàn ổ đĩa), tìm file
+         * MỚI không nằm trong manifest, tên khớp mẫu ransom note, và được
+         * tạo SAU khi tiến trình bắt đầu chạy — điều kiện thời gian này để
+         * không đụng file người dùng đã đặt sẵn từ trước (vd tự tạo README
+         * để test).
+         */
+        int CleanRansomNotes(DWORD pid) {
+            std::set<std::wstring> dirs;
+            std::set<std::wstring> knownFiles;
+            uint64_t startTime = 0;
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                auto it = coll_.find(pid);
+                if (it == coll_.end()) return 0;
+                startTime = it->second.startTime;
+                for (auto& e : it->second.entries) {
+                    std::wstring dir = fs::path(e.originalPath).parent_path().wstring();
+                    if (!dir.empty()) dirs.insert(ToLower(dir));
+                    knownFiles.insert(ToLower(e.originalPath));
+                }
+            }
+            if (dirs.empty() || startTime == 0) return 0;
+
+            /* Biên an toàn 2 giây (đơn vị FILETIME, 100ns) cho sai số đo thời gian */
+            constexpr uint64_t kMarginFt = 2ull * 10'000'000;
+            uint64_t cutoff = (startTime > kMarginFt) ? startTime - kMarginFt : 0;
+
+            int removed = 0;
+            std::error_code ec;
+            for (const auto& dir : dirs) {
+                for (auto& de : fs::directory_iterator(dir, ec)) {
+                    if (!de.is_regular_file(ec)) { ec.clear(); continue; }
+
+                    std::wstring full = ToLower(de.path().wstring());
+                    if (knownFiles.count(full)) continue;
+                    if (!LooksLikeRansomNote(de.path().filename().wstring())) continue;
+
+                    WIN32_FILE_ATTRIBUTE_DATA fad{};
+                    if (!GetFileAttributesExW(de.path().c_str(), GetFileExInfoStandard, &fad))
+                        continue;
+                    ULARGE_INTEGER ct{};
+                    ct.LowPart = fad.ftCreationTime.dwLowDateTime;
+                    ct.HighPart = fad.ftCreationTime.dwHighDateTime;
+                    if (ct.QuadPart < cutoff) continue;   /* có trước khi tiến trình chạy -> bỏ qua */
+
+                    if (fs::remove(de.path(), ec)) {
+                        removed++;
+                        LOG_D("   [CLEAN] Xoa ransom note: %s",
+                            ws2s(de.path().filename().wstring()).c_str());
+                    }
+                    ec.clear();
+                }
+                ec.clear();
+            }
+            if (removed > 0)
+                LOG_I("   [CLEAN] Da xoa %d ransom note.", removed);
             return removed;
         }
 

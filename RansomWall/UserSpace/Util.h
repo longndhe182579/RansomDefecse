@@ -1,6 +1,6 @@
 /*
  * Util.h — Tiện ích dùng chung. Header-only.
- *   - Logger thread-safe (v3.0 dùng std::cout đa luồng -> log xen kẽ)
+ *   - Logger thread-safe (tránh log xen kẽ khi nhiều luồng ghi std::cout)
  *   - Entropy Shannon
  *   - SHA-256 qua BCrypt (không cần thư viện ngoài)
  *   - Chuyển kernel path -> DOS path
@@ -46,9 +46,7 @@ namespace rw {
     using Clock = std::chrono::steady_clock;
     using TimePoint = Clock::time_point;
 
-    /* ======================================================================
-       CHUYỂN ĐỔI CHUỖI
-       ====================================================================== */
+    /* ---- Chuyển đổi chuỗi ---- */
     inline std::string ws2s(const std::wstring& ws) {
         if (ws.empty()) return {};
         int sz = WideCharToMultiByte(CP_UTF8, 0, ws.data(), (int)ws.size(),
@@ -73,32 +71,16 @@ namespace rw {
         return s;
     }
 
-    /* ======================================================================
-       LOGGER — thread-safe
-       ====================================================================== */
+    /* ---- Logger — thread-safe ---- */
     enum class LogLevel { Debug, Info, Warn, Error, Alert };
 
-    /* ======================================================================
-       LOGGER  v4.5
-       ======================================================================
-       [FIX 19] BA VẤN ĐỀ CỦA BẢN CŨ:
-
-       1. min_ KHÔNG BAO GIỜ ĐƯỢC KIỂM TRA trong Log() -> SetMinLevel() vô
-          tác dụng, mọi dòng DEBUG đều in ra console.
-
-       2. Không tách mức console và file. Console cần gọn để người dùng theo
-          dõi; file cần đầy đủ để phân tích sau.
-
-       3. Không gộp dòng lặp. Đo được: 109 dòng "Honey bi cham boi tien trinh
-          whitelist" liên tiếp khi Search Indexer quét 110 honey file mới tạo.
-          Cộng thêm hàng trăm dòng [PROC] ... -> tra cay.
-
-       GIẢI PHÁP:
-         - ConsoleLevel mặc định Info, FileLevel mặc định Debug
-           -> console sạch, file vẫn đủ dữ liệu
-         - Gộp dòng LẶP LIÊN TIẾP giống hệt nhau thành 1 dòng + "(x N)"
-         - LOG_T(ms, ...) cho thông điệp biết trước là ồn
-       ====================================================================== */
+    /*
+     * Console và file dùng ngưỡng log riêng: console cần gọn để người dùng
+     * theo dõi, file cần đầy đủ (Debug) để phân tích sau. Các dòng lặp lại
+     * liên tiếp giống hệt nhau được gộp thành một dòng kèm bộ đếm, vì các
+     * tiến trình ồn (vd Search Indexer quét hàng loạt honey file mới tạo)
+     * có thể sinh hàng trăm dòng log trùng lặp liên tiếp.
+     */
     class Logger {
     public:
         static Logger& I() { static Logger l; return l; }
@@ -198,8 +180,8 @@ namespace rw {
         struct ThrottleState { uint64_t last; uint64_t skipped; };
 
         std::mutex  m_;
-        LogLevel    consoleLv_ = LogLevel::Info;    /* console: gọn */
-        LogLevel    fileLv_ = LogLevel::Debug;   /* file: đầy đủ */
+        LogLevel    consoleLv_ = LogLevel::Info;
+        LogLevel    fileLv_ = LogLevel::Debug;
         FILE* f_ = nullptr;
 
         std::string lastMsg_;
@@ -277,9 +259,7 @@ namespace rw {
 #define LOG_TD(key, ms, ...) rw::Logger::I().LogThrottled(rw::LogLevel::Debug, key, ms, __VA_ARGS__)
 #define LOG_TI(key, ms, ...) rw::Logger::I().LogThrottled(rw::LogLevel::Info , key, ms, __VA_ARGS__)
 
-    /* ======================================================================
-       ENTROPY
-       ====================================================================== */
+    /* ---- Entropy ---- */
     inline double CalculateEntropy(const uint8_t* data, size_t size) {
         if (size == 0) return 0.0;
         size_t cnt[256] = {};
@@ -294,11 +274,9 @@ namespace rw {
     }
 
     /*
-     * Đọc N byte đầu file. MẶC ĐỊNH 4096.
-     *
-     * LỖI v3.0: đọc magic[16] rồi tính entropy và so > 7.0.
-     * Entropy của 16 byte tối đa là log2(16) = 4.0 -> điều kiện KHÔNG BAO GIỜ đúng.
-     * Đây là dead code toán học.
+     * Đọc N byte đầu file, mặc định 4096. Lưu ý: entropy tối đa của một mẫu
+     * n byte là log2(n) — với mẫu quá ngắn (vd 16 byte, tối đa 4.0) so sánh
+     * với ngưỡng entropy cao (vd > 7.0) sẽ không bao giờ đúng.
      */
     inline std::vector<uint8_t> ReadHead(const std::wstring& path, size_t n = 4096) {
         std::vector<uint8_t> buf;
@@ -328,36 +306,36 @@ namespace rw {
     }
 
 
-    /* ======================================================================
-       DIFFERENTIAL AREA ANALYSIS (DAA)
-       Davies et al., "Differential Area Analysis for Ransomware Attack
-       Detection within Mixed File Datasets", arXiv:2106.14418, 2021.
+    /*
+     * Differential Area Analysis (DAA) — Davies et al., "Differential Area
+     * Analysis for Ransomware Attack Detection within Mixed File Datasets",
+     * arXiv:2106.14418, 2021.
+     *
+     * Đo độ tương đồng giữa entropy curve của header file với đường chuẩn
+     * của dữ liệu ngẫu nhiên thuần túy (random data reference curve).
+     *
+     * Phương pháp:
+     *   1. Đọc 256 byte đầu file
+     *   2. Tính Shannon entropy tại 32 điểm (8,16,24...256 byte)
+     *   3. Tính diện tích chênh lệch giữa curve file và random curve
+     *      bằng Composite Trapezoidal Rule
+     *   4. Diện tích nhỏ → gần random → khả năng cao bị mã hoá
+     *
+     * Ưu điểm so với so sánh entropy trước/sau (ΔH):
+     *   - Không cần baseline entropy_before
+     *   - Phân biệt được file nén vs file mã hoá (ZIP header thấp, AES header cao)
+     *   - Bắt được file mới tạo ra (Cerber, LockBit) ngay lập tức
+     *   - Chỉ đọc 256 byte → nhanh hơn nhiều so với full-file entropy
+     *
+     * Ngưỡng 56 Bit-Bytes tại 256 byte header cho accuracy 99.96%
+     * (Davies et al. Table 7)
+     */
 
-       Đo độ tương đồng giữa entropy curve của header file với đường chuẩn
-       của dữ liệu ngẫu nhiên thuần túy (random data reference curve).
-
-       Phương pháp:
-         1. Đọc 256 byte đầu file
-         2. Tính Shannon entropy tại 32 điểm (8,16,24...256 byte)
-         3. Tính diện tích chênh lệch giữa curve file và random curve
-            bằng Composite Trapezoidal Rule
-         4. Diện tích nhỏ → gần random → khả năng cao bị mã hoá
-
-       Ưu điểm so với F13 (ΔH):
-         - Không cần CoW baseline (entropy_before)
-         - Phân biệt được file nén vs file mã hoá (ZIP header thấp, AES header cao)
-         - Bắt được file mới tạo ra (Cerber, LockBit) ngay lập tức
-         - Chỉ đọc 256 byte → nhanh hơn 1000x so với full-file entropy
-
-       Ngưỡng 56 Bit-Bytes tại 256 byte header cho accuracy 99.96%
-       (Davies et al. Table 7)
-       ====================================================================== */
-
-       /*
-        * kRandCurve — entropy của file chứa pure random bytes tại 8..256 byte.
-        * Tính trước từ os.urandom(1000 files) theo Algorithm 1 của bài báo.
-        * Index i → entropy tại (i+1)*8 byte.
-        */
+    /*
+     * kRandCurve — entropy của file chứa pure random bytes tại 8..256 byte.
+     * Tính trước từ os.urandom(1000 files) theo Algorithm 1 của bài báo.
+     * Index i → entropy tại (i+1)*8 byte.
+     */
     inline const double* GetRandCurve() {
         static const double kRandCurve[32] = {
             2.976, 3.941, 4.496, 4.878, 5.171, 5.418, 5.633, 5.820,
@@ -405,9 +383,7 @@ namespace rw {
         return area < 0 ? -area : area;
     }
 
-    /* ======================================================================
-       SHA-256 qua BCrypt
-       ====================================================================== */
+    /* ---- SHA-256 qua BCrypt ---- */
     inline std::string BytesToHex(const uint8_t* p, size_t n) {
         static const char* k = "0123456789abcdef";
         std::string s; s.reserve(n * 2);
@@ -446,9 +422,7 @@ namespace rw {
         return result;
     }
 
-    /* ======================================================================
-       ĐƯỜNG DẪN
-       ====================================================================== */
+    /* ---- Đường dẫn ---- */
     inline std::wstring GetKnownFolder(REFKNOWNFOLDERID id) {
         PWSTR p = nullptr; std::wstring r;
         if (SUCCEEDED(SHGetKnownFolderPath(id, 0, nullptr, &p))) { r = p; CoTaskMemFree(p); }
@@ -489,9 +463,7 @@ namespace rw {
         return (p == std::wstring::npos) ? path : path.substr(p + 1);
     }
 
-    /* ======================================================================
-       TIẾN TRÌNH
-       ====================================================================== */
+    /* ---- Tiến trình ---- */
     inline std::wstring GetProcessImagePath(DWORD pid) {
         HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
         if (!h) return {};
@@ -536,15 +508,12 @@ namespace rw {
         return std::to_wstring(pid) + L"_" + std::to_wstring(startTime);
     }
 
-    /* ======================================================================
-       CÂY TIẾN TRÌNH — chống đệ quy vô hạn
-       ======================================================================
-       RansomWall spawn diec.exe -> driver báo "process create"
-       -> RansomWall phân tích diec.exe -> spawn diec.exe ĐỂ QUÉT diec.exe
-       -> driver báo "process create" -> ... VÒNG LẶP VÔ HẠN.
-
-       conhost.exe cũng vậy: mỗi console app sinh một conhost.
-       ====================================================================== */
+    /*
+     * Cây tiến trình — chống đệ quy vô hạn: nếu RansomWall spawn một tiến
+     * trình để quét nó, driver sẽ báo "process create" cho chính tiến trình
+     * đó, RansomWall lại phân tích và spawn để quét tiếp -> vòng lặp vô hạn.
+     * conhost.exe cũng vậy: mỗi console app sinh một conhost.
+     */
     inline DWORD GetParentPID(DWORD pid) {
         DWORD parent = 0;
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -622,9 +591,7 @@ namespace rw {
         return best;
     }
 
-    /* ======================================================================
-       THỜI GIAN
-       ====================================================================== */
+    /* ---- Thời gian ---- */
     inline std::string IsoNow() {
         SYSTEMTIME st; GetSystemTime(&st);
         char b[40];
@@ -637,9 +604,7 @@ namespace rw {
             std::chrono::system_clock::now().time_since_epoch()).count();
     }
 
-    /* ======================================================================
-       JSON TỐI GIẢN  (đủ cho manifest + ML payload, không cần thư viện ngoài)
-       ====================================================================== */
+    /* ---- JSON tối giản (đủ cho manifest + ML payload, không cần thư viện ngoài) ---- */
     class JsonW {
     public:
         JsonW& Begin() { os_ << '{'; first_ = true; return *this; }

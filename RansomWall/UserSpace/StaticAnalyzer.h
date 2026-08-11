@@ -1,18 +1,17 @@
 /*
  * StaticAnalyzer.h — Phân tích tĩnh (F1, F2, F3, F5).
  *
- * SỬA LỖI v3.0:
- *   F2: entropy fallback tính trên 64KB ĐẦU FILE — vùng đó là PE header +
- *       import table, entropy tự nhiên thấp -> fallback gần như không bao giờ bật.
- *       v4.0: parse section table, tính entropy RIÊNG từng section,
- *       chỉ quan tâm section THỰC THI.
+ * F2 tính entropy riêng cho từng section PE, chỉ xét section THỰC THI — nếu
+ * tính trên vùng đầu file (PE header + import table) thì entropy tự nhiên
+ * thấp và không phản ánh được nội dung đã pack/encrypt.
  *
- *   F5: v3.0 dùng find() chuỗi "cryptencrypt" trên 4MB đầu.
- *       File bị pack -> IAT ẩn -> MISS. Chuỗi trùng ngẫu nhiên -> FALSE HIT.
- *       v4.0: parse IMAGE_IMPORT_DESCRIPTOR thật.
+ * F5 parse trực tiếp IMAGE_IMPORT_DESCRIPTOR thay vì tìm chuỗi tên hàm
+ * ("cryptencrypt"...) trong dữ liệu thô: file bị pack sẽ ẩn IAT khỏi kiểu
+ * tìm chuỗi đó, và chuỗi trùng ngẫu nhiên có thể gây báo động giả.
  *
- *   Toàn bộ hàm ở đây chạy NGOÀI mutex. v3.0 giữ lock suốt DIE 5s + FLOSS 15s
- *   -> đóng băng engine động 20 giây trong lúc ransomware đang chạy.
+ * Toàn bộ hàm ở đây chạy NGOÀI mutex bảo vệ engine động: DIE có thể mất vài
+ * giây, FLOSS mất hàng chục giây, giữ lock trong lúc đó sẽ đóng băng phần
+ * giám sát runtime ngay khi ransomware đang hoạt động.
  */
 #pragma once
 
@@ -22,11 +21,13 @@
 #include <wintrust.h>
 #include <softpub.h>
 #include <mscat.h>
-#include <bcrypt.h>      /* [FIX 13] BCRYPT_SHA256_ALGORITHM */
+#include <bcrypt.h>      /* BCRYPT_SHA256_ALGORITHM */
 
 #pragma comment(lib, "wintrust.lib")
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "sfc.lib")
+#include <sfc.h>        /* SfcIsFileProtected — fallback cho file he thong Windows */
 
 namespace rw {
 
@@ -39,19 +40,16 @@ namespace rw {
         std::string imageSha256;
     };
 
-    /* ======================================================================
-       F1 — Chữ ký số
-       ======================================================================
-       LỖI ĐÃ SỬA:
-         Bản cũ chỉ gọi WinVerifyTrust với WTD_CHOICE_FILE -> chỉ đọc chữ ký
-         NHÚNG TRONG FILE. Nhưng file hệ thống Windows (conhost.exe, svchost.exe,
-         dllhost.exe, phần lớn System32) được ký qua SECURITY CATALOG (.cat trong
-         C:\Windows\System32\CatRoot), KHÔNG nhúng chữ ký.
-
-         Kết quả: F1 bật cho gần như MỌI binary Microsoft -> nhiễu + sai.
-
-       Sửa: thử embedded trước, thất bại thì tra catalog.
-       ====================================================================== */
+    /*
+     * F1 — Chữ ký số.
+     *
+     * Chỉ gọi WinVerifyTrust với WTD_CHOICE_FILE là không đủ: cách đó chỉ đọc
+     * chữ ký NHÚNG TRONG FILE. Phần lớn file hệ thống Windows (conhost.exe,
+     * svchost.exe, dllhost.exe, đa số System32) được ký qua SECURITY CATALOG
+     * (.cat trong C:\Windows\System32\CatRoot) chứ không nhúng chữ ký trực
+     * tiếp, nên nếu chỉ kiểm tra embedded thì F1 sẽ bật nhầm cho gần như mọi
+     * binary Microsoft. Vì vậy cần thử embedded trước, thất bại thì tra catalog.
+     */
 
     inline bool VerifyEmbeddedSignature(const std::wstring& path) {
         WINTRUST_FILE_INFO fi{};
@@ -74,37 +72,23 @@ namespace rw {
         return r == ERROR_SUCCESS;
     }
 
-    /* ======================================================================
-       [FIX 13] CATALOG DÙNG SHA-256 TỪ WINDOWS 10 — BẢN CŨ TÍNH SHA-1
-       ======================================================================
-       Bản cũ gọi:
-           CryptCATAdminAcquireContext(&hCatAdmin, &action, 0)
-           CryptCATAdminCalcHashFromFileHandle(hFile, &hashLen, ...)
-
-       CẢ HAI HÀM NÀY MẶC ĐỊNH BĂM SHA-1.
-
-       Nhưng catalog trong C:\Windows\System32\CatRoot trên Windows 10/11 được
-       ký bằng SHA-256. Hash SHA-1 tính ra KHÔNG KHỚP entry nào ->
-       CryptCATAdminEnumCatalogFromHash trả NULL -> hàm trả false.
-
-       Hệ quả đo được trong log thực tế: cmd.exe, conhost.exe, powercfg.exe,
-       vssadmin.exe, VSSVC.exe, wbadmin.exe... ĐỀU báo "khong co chu ky hop le".
-       -> F1 bật cho ~100% tiến trình, mất hết giá trị phân biệt
-       -> ShouldAnalyzeStatically không lọc được gì -> DIE chạy trên MỌI binary
-          Windows -> bão quét tĩnh (30+ dòng "Cache MISS: conhost.exe" mỗi lần)
-
-       SỬA: dùng API thế hệ 2 (có từ Windows 8):
-           CryptCATAdminAcquireContext2(..., BCRYPT_SHA256_ALGORITHM, ...)
-           CryptCATAdminCalcHashFromFileHandle2(hCatAdmin, ...)
-
-       Vẫn giữ đường lui SHA-1 cho Windows 7 hoặc catalog cũ.
-
-       LƯU Ý VỀ THUẬT NGỮ (cho báo cáo):
-         Động cơ xác minh trong CẢ HAI đường vẫn là WinVerifyTrust.
-         Nhóm CryptCATAdmin* KHÔNG xác minh gì — chúng chỉ (1) tính hash file
-         và (2) tra xem hash nằm trong file .cat nào. Có đường dẫn .cat rồi
-         mới gọi WinVerifyTrust với WTD_CHOICE_CATALOG.
-       ====================================================================== */
+    /*
+     * CryptCATAdminAcquireContext / CryptCATAdminCalcHashFromFileHandle (API
+     * thế hệ 1) mặc định băm SHA-1. Nhưng catalog trong
+     * C:\Windows\System32\CatRoot trên Windows 10/11 được ký bằng SHA-256,
+     * nên hash SHA-1 không khớp entry nào, CryptCATAdminEnumCatalogFromHash
+     * trả NULL, và toàn bộ tiến trình xác minh catalog thất bại — kể cả với
+     * binary hệ thống hợp lệ (cmd.exe, conhost.exe, vssadmin.exe...). Do đó
+     * cần dùng API thế hệ 2 (từ Windows 8): CryptCATAdminAcquireContext2 /
+     * CryptCATAdminCalcHashFromFileHandle2 với BCRYPT_SHA256_ALGORITHM, và
+     * chỉ lùi về API SHA-1 khi thế hệ 2 không khả dụng (Windows 7 hoặc
+     * catalog đời cũ).
+     *
+     * Về thuật ngữ: động cơ xác minh thật sự trong cả hai đường vẫn là
+     * WinVerifyTrust. Nhóm CryptCATAdmin* không xác minh gì — chúng chỉ
+     * (1) tính hash file và (2) tra xem hash đó nằm trong file .cat nào.
+     * Có đường dẫn .cat rồi mới gọi WinVerifyTrust với WTD_CHOICE_CATALOG.
+     */
 
        /* Xác minh một file dựa trên catalog đã định vị được */
     inline bool VerifyAgainstCatalog(HCATADMIN hCatAdmin, HCATINFO hCatInfo,
@@ -234,13 +218,22 @@ namespace rw {
      * Thiếu chế độ thứ hai = F1 bật cho mọi binary Microsoft.
      */
     inline bool VerifySignature(const std::wstring& path) {
+        /* Buoc 1: Chu ky nhung trong PE (Chrome, 7-Zip, Git, phan mem thuong mai) */
         if (VerifyEmbeddedSignature(path)) return true;
-        return VerifyCatalogSignature(path);
+
+        /* Buoc 2: Chu ky qua catalog Windows (.cat files) */
+        if (VerifyCatalogSignature(path)) return true;
+
+        /* Buoc 3: SfcIsFileProtected — Windows File Protection (WFP).
+           Fallback cho cac file he thong ma CryptCATAdminEnumCatalogFromHash
+           van tra ve NULL (certutil.exe, conhost.exe, SearchFilterHost.exe,...).
+           Neu WFP bao ve file nay thi no chac chan la binary Microsoft hop le. */
+        if (SfcIsFileProtected(nullptr, path.c_str())) return true;
+
+        return false;
     }
 
-    /* ======================================================================
-       PE MAPPER — đọc file vào RAM, cung cấp RVA->offset
-       ====================================================================== */
+    /* ---- PE MAPPER — đọc file vào RAM, cung cấp RVA->offset ---- */
     class PeImage {
     public:
         bool Load(const std::wstring& path) {
@@ -316,9 +309,7 @@ namespace rw {
         }
     };
 
-    /* ======================================================================
-       F2 — Packer/Cryptor: entropy theo SECTION THỰC THI
-       ====================================================================== */
+    /* ---- F2 — Packer/Cryptor: entropy theo SECTION THỰC THI ---- */
     inline bool DetectPackedBySection(const PeImage& pe) {
         auto* sec = pe.Sections();
         for (WORD i = 0; i < pe.SectionCount(); i++) {
@@ -363,9 +354,60 @@ namespace rw {
         return false;
     }
 
-    /* ======================================================================
-       F5 — Crypto API: parse IMPORT ADDRESS TABLE thật
-       ====================================================================== */
+    /* Duyệt một bảng thunk (IAT/INT) tại thunkRva, so tên hàm với danh sách
+       fns. Dùng chung cho cả import thường và delay-import — cả hai đều
+       lưu thunk theo cùng format IMAGE_THUNK_DATA. */
+    inline bool ScanThunkNames(const PeImage& pe, DWORD thunkRva,
+        const char* const* fns, size_t nFns, const char** hitOut = nullptr) {
+        DWORD thunkOff = pe.RvaToOffset(thunkRva);
+        if (!thunkOff) return false;
+
+        for (int t = 0; t < 4096; t++) {
+            DWORD nameRva = 0;
+            if (pe.Is64()) {
+                auto* th = pe.At<ULONGLONG>(thunkOff + t * sizeof(ULONGLONG));
+                if (!th || *th == 0) break;
+                if (*th & IMAGE_ORDINAL_FLAG64) continue;      // import theo ordinal
+                nameRva = (DWORD)*th;
+            }
+            else {
+                auto* th = pe.At<DWORD>(thunkOff + t * sizeof(DWORD));
+                if (!th || *th == 0) break;
+                if (*th & IMAGE_ORDINAL_FLAG32) continue;
+                nameRva = *th;
+            }
+            DWORD nameOff = pe.RvaToOffset(nameRva);
+            if (!nameOff) continue;
+            const char* fn = pe.StrAt(nameOff + 2);   // bỏ WORD Hint
+            if (!fn) continue;
+
+            for (size_t i = 0; i < nFns; i++)
+                if (_stricmp(fn, fns[i]) == 0) {
+                    if (hitOut) *hitOut = fn;
+                    return true;
+                }
+        }
+        return false;
+    }
+
+    /* Layout ổn định của IMAGE_DELAYLOAD_DESCRIPTOR, định nghĩa lại tại chỗ
+       để không phụ thuộc <delayimp.h> — chỉ đọc offset, không gọi API
+       delay-load nào. */
+    struct RwDelayDesc {
+        DWORD Attributes, DllNameRVA, ModuleHandleRVA, ImportAddressTableRVA,
+            ImportNameTableRVA, BoundImportAddressTableRVA,
+            UnloadInformationTableRVA, TimeDateStamp;
+    };
+
+    /*
+     * F5 — Crypto API: parse cả IMPORT thường lẫn DELAY-IMPORT.
+     *
+     * Binary build với /DELAYLOAD (nạp bcrypt.dll/advapi32.dll trễ lúc cần)
+     * lưu tên hàm ở IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, KHÔNG nằm trong
+     * IMAGE_DIRECTORY_ENTRY_IMPORT — chỉ quét import thường sẽ bỏ sót,
+     * trong khi đây vẫn là thông tin tĩnh 100%, không cần resolve API lúc
+     * chạy để né.
+     */
     inline bool DetectCryptoImports(const PeImage& pe) {
         static const char* kCryptoFns[] = {
             "CryptEncrypt", "CryptDecrypt", "CryptGenKey", "CryptImportKey",
@@ -374,66 +416,55 @@ namespace rw {
             "BCryptImportKey", "BCryptOpenAlgorithmProvider",
             "NCryptEncrypt", "NCryptDecrypt", "RtlEncryptMemory",
         };
+        const size_t nFns = ARRAYSIZE(kCryptoFns);
+        const char* hit = nullptr;
 
         DWORD impRva = pe.DirRva(IMAGE_DIRECTORY_ENTRY_IMPORT);
         if (!impRva) {
             LOG_D("      Khong co import directory (co the da bi pack)");
-            return false;
         }
-        DWORD impOff = pe.RvaToOffset(impRva);
-        if (!impOff) return false;
+        else {
+            DWORD impOff = pe.RvaToOffset(impRva);
+            for (int d = 0; impOff && d < 256; d++) {
+                auto* desc = pe.At<IMAGE_IMPORT_DESCRIPTOR>(impOff + d * sizeof(IMAGE_IMPORT_DESCRIPTOR));
+                if (!desc || desc->Name == 0) break;
 
-        for (int d = 0; d < 256; d++) {
-            auto* desc = pe.At<IMAGE_IMPORT_DESCRIPTOR>(impOff + d * sizeof(IMAGE_IMPORT_DESCRIPTOR));
-            if (!desc || desc->Name == 0) break;
-
-            DWORD thunkRva = desc->OriginalFirstThunk ? desc->OriginalFirstThunk : desc->FirstThunk;
-            if (!thunkRva) continue;
-            DWORD thunkOff = pe.RvaToOffset(thunkRva);
-            if (!thunkOff) continue;
-
-            for (int t = 0; t < 4096; t++) {
-                DWORD nameRva = 0;
-                if (pe.Is64()) {
-                    auto* th = pe.At<ULONGLONG>(thunkOff + t * sizeof(ULONGLONG));
-                    if (!th || *th == 0) break;
-                    if (*th & IMAGE_ORDINAL_FLAG64) continue;      // import theo ordinal
-                    nameRva = (DWORD)*th;
+                DWORD thunkRva = desc->OriginalFirstThunk ? desc->OriginalFirstThunk : desc->FirstThunk;
+                if (thunkRva && ScanThunkNames(pe, thunkRva, kCryptoFns, nFns, &hit)) {
+                    LOG_I("      -> import Crypto API: %s", hit);
+                    return true;
                 }
-                else {
-                    auto* th = pe.At<DWORD>(thunkOff + t * sizeof(DWORD));
-                    if (!th || *th == 0) break;
-                    if (*th & IMAGE_ORDINAL_FLAG32) continue;
-                    nameRva = *th;
-                }
-                DWORD nameOff = pe.RvaToOffset(nameRva);
-                if (!nameOff) continue;
-                const char* fn = pe.StrAt(nameOff + 2);   // bỏ WORD Hint
-                if (!fn) continue;
-
-                for (auto* k : kCryptoFns)
-                    if (_stricmp(fn, k) == 0) {
-                        LOG_I("      -> import Crypto API: %s", fn);
-                        return true;
-                    }
             }
         }
+
+        DWORD delayRva = pe.DirRva(IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT);
+        if (delayRva) {
+            DWORD delayOff = pe.RvaToOffset(delayRva);
+            for (int d = 0; delayOff && d < 256; d++) {
+                auto* desc = pe.At<RwDelayDesc>(delayOff + d * sizeof(RwDelayDesc));
+                if (!desc || desc->DllNameRVA == 0) break;
+
+                if (desc->ImportNameTableRVA &&
+                    ScanThunkNames(pe, desc->ImportNameTableRVA, kCryptoFns, nFns, &hit)) {
+                    LOG_I("      -> delay-import Crypto API: %s", hit);
+                    return true;
+                }
+            }
+        }
+
         return false;
     }
 
-    /* ======================================================================
-       F3 / F6 — Quét chuỗi
-       ======================================================================
-       LỖI ĐÃ SỬA: dùng find() substring cho MỌI từ khoá.
-         "conti" khớp "continue"   -> floss.exe, diec.exe, mọi binary có
-                                      thông báo lỗi tiếng Anh đều dính
-         "hive"  khớp "archive"    -> tương tự
-         "decrypt" khớp mọi thư viện crypto hợp lệ
-
-       Sửa:
-         - PHRASE: cụm dài, đặc trưng -> substring là đủ, 1 hit = bật cờ
-         - WORD:   tên họ ngắn -> phải khớp BIÊN TỪ, và cần >= 2 từ khác nhau
-       ====================================================================== */
+    /*
+     * F3 / F6 — Quét chuỗi.
+     *
+     * Dùng find() substring thuần cho mọi từ khoá là không an toàn: "conti"
+     * khớp cả "continue" (floss.exe, diec.exe, mọi binary có thông báo lỗi
+     * tiếng Anh), "hive" khớp "archive", "decrypt" khớp cả thư viện crypto
+     * hợp lệ. Vì vậy tách hai loại từ khoá:
+     *   - PHRASE: cụm dài, đặc trưng -> substring là đủ, 1 hit = bật cờ
+     *   - WORD:   tên họ ngắn -> phải khớp BIÊN TỪ, và cần >= 2 từ khác nhau
+     */
 
        /* Khớp needle như một TỪ RIÊNG, không phải substring */
     inline bool ContainsWord(const std::string& hay, const std::string& needle) {
@@ -449,19 +480,161 @@ namespace rw {
         return false;
     }
 
-    /* Cụm dài, đặc trưng — không thể trùng ngẫu nhiên */
+    /*
+     * Cụm dài, đặc trưng — không thể trùng ngẫu nhiên. Danh sách gộp từ
+     * corpus ransom note thực tế (140 mục đầu) cộng thêm các mục cũ của
+     * RansomWall (đuôi file/tên riêng đặc trưng — Dharma, LockBit,
+     * Stop/DJVU, Ryuk...) chưa có trong corpus.
+     */
     inline const std::vector<std::string>& RansomPhrases() {
         static const std::vector<std::string> k = {
-            /* Ransom note phrases — phổ biến nhất */
+            "all leaked data",
+            "are encrypted backups",
+            "backups were either encrypted",
+            "choose mode for",
+            "damage encrypted data",
+            "data after payment",
+            "data and are ready to publish",
+            "data are stolen",
+            "data has been encrypted",
+            "data has been stolen",
+            "data is encrypted",
+            "data is stolen",
+            "data leak from your company",
+            "data was encrypted",
+            "data was leaked",
+            "data we usually steal",
+            "data were encrypted",
+            "data will be leaked",
+            "data will be published",
+            "decrypt all your files",
+            "decrypt one file",
+            "decrypt software to restore",
+            "decrypt some files",
+            "decrypt the files",
+            "decrypt two random files",
+            "decrypt using third party software",
+            "decrypt without the key",
+            "decrypt your data",
+            "decrypt your files",
+            "decrypting of your files",
+            "decrypting your servers",
+            "decryption help programs",
+            "decryption key will be deleted",
+            "decryption keys will be permanently",
+            "decryption of your files",
+            "decryption software for your situation",
+            "decryption software is available",
+            "decryption software is perfectly",
+            "decryption tool and the how",
+            "decryption tool will make",
+            "decryptor key that only",
+            "download the tor browser",
+            "download tor browser",
+            "encrypted and readme files",
+            "encrypted backups are deleted",
+            "encrypted data but not recover",
+            "encrypted file will be corrupted",
+            "encrypted files have new",
+            "encrypted files may",
+            "encrypted files yourself",
+            "encrypted or deleted or backup",
+            "encrypted your files",
+            "encrypted your workstations and servers",
+            "enter safe mode",
+            "every encrypted file",
+            "file to confirm that our decryptor",
+            "files and we will decrypt",
+            "files are currently encrypted",
+            "files are encrypted",
+            "files for free decryption",
+            "files has been encrypted",
+            "files have been encrypted",
+            "files have been stolen",
+            "files our decrypt",
+            "files that were stolen",
+            "files were encrypted",
+            "files were stolen",
+            "files will be published",
+            "files will remain encrypted",
+            "find command for",
+            "get decryption software",
+            "have decryption software",
+            "install the tor browser",
+            "install tor browser",
+            "key and decrypt",
+            "key our decrypt",
+            "leaked data is disclosed",
+            "leaked data samples",
+            "leaked data will be disclosed",
+            "link for tor browser",
+            "link in tor browser",
+            "modify encrypted files",
+            "network and encrypted",
+            "network has been encrypted",
+            "network have been encrypted",
+            "network is encrypted",
+            "no decryption software",
+            "not get sfx",
+            "not read sfx",
+            "not write sfx",
+            "open the tor browser",
+            "open tor browser",
+            "our decrypt software",
+            "our decryption software",
+            "our decryption tool",
+            "pay the ransom",
+            "pay we will release your data",
+            "programs for decryption",
+            "public decryption software",
+            "publishing your data",
+            "publishing your files",
+            "ransom the data",
+            "ransom we will attack",
+            "rename encrypted files",
+            "review leaked data",
+            "run tor browser",
+            "servers and hosts were completely encrypted",
+            "servers are encrypted",
+            "site you will need tor browser",
+            "software to decrypt",
+            "special decryption software",
+            "stolen from your network",
+            "system was encrypted",
+            "systems are encrypted",
+            "the data leak",
+            "the decryption keys",
+            "the decryption software",
+            "the decryption tool",
+            "the encrypted files",
+            "the leaked data",
+            "the ransom amount",
+            "tool and decrypt",
+            "tool will make decryption",
+            "tor browser and visit",
+            "tor browser bundle install",
+            "tor browser from this site",
+            "tor browser open",
+            "tor browser to access",
+            "tor browser to open",
+            "tor browser using",
+            "unique decryption key",
+            "use tor browser",
+            "using tor browser",
+            "via tor browser",
+            "website in the tor browser",
+            "windows for workgroups",
+            "working decryption tool",
+            "your decryption keys",
+            "your encrypted files",
+            "your leaked data",
             "your files have been encrypted",
             "all your files are encrypted",
             "your files are encrypted",
-            "files have been encrypted",
             "how to decrypt your files",
             "restore your files",
             "pay to recover",
             "decryption key",
-            "decrypt your data",
             "bitcoin wallet",
             "btc wallet",
             "tor browser",
@@ -471,41 +644,30 @@ namespace rw {
             "your network has been",
             "wanadecryptor",
             "@wanadecryptor@",
-
-            /* Dharma/Phobos — hardcode trong binary */
-            "id-[",                         /* naming: file.id-[xxxx].[email].dharma */
+            "id-[",
             ".dharma",
             ".phobos",
             ".eking",
             ".acute",
             ".barak",
             ".combo",
-            ".java",                        /* Dharma variant */
-            "harma@",                       /* email pattern */
+            ".java",
+            "harma@",
             "phobos@",
-
-            /* LockBit */
             "lockbit",
             "restore-my-files",
             "!!restore-my-files!!",
-
-            /* Stop/DJVU — đuôi file đặc trưng */
             ".djvu",
-            /* ".stop" bỏ — quá chung, 7-Zip và nhiều tool có chuỗi này */
             "openme.txt",
             "_readme.txt",
             "restorefiles.txt",
-
-            /* Ryuk */
             "ryuk",
             "rypnotes",
-
-            /* Common C2 / ransom note markers */
             "your personal id",
             "unique id",
             "files are locked",
             "send email",
-            "contact us",                   /* chỉ khi kết hợp với context encrypt */
+            "contact us",
             "recovery key",
             "do not rename encrypted",
             "do not try to decrypt",
@@ -516,33 +678,193 @@ namespace rw {
     /*
      * TÊN HỌ RANSOMWARE — MỘT hit là ĐỦ.
      *
-     * LỖI ĐÃ SỬA (F3 MISS WannaCry thật):
-     *   Bản trước gộp chung tên họ với từ chung chung rồi bắt phải có >=2 từ.
-     *   WannaCry thật chỉ có ĐÚNG MỘT token: "wncry"
-     *   -> log: (F3: chi 1 tu "wncry" — chua du, can >=2)
-     *   -> F3 = 0 cho ransomware nổi tiếng nhất lịch sử. Sửa quá tay.
+     * Không được gộp chung tên họ với nhóm "từ chung chung" rồi bắt buộc
+     * >= 2 hit: mẫu WannaCry thật chỉ chứa đúng một token đặc trưng là
+     * "wncry", nên yêu cầu >= 2 sẽ khiến F3 miss chính ransomware nổi tiếng
+     * nhất lịch sử. Nhờ ContainsWord khớp theo biên từ (không phải
+     * substring), "conti" đứng riêng không còn khớp nhầm "continue" nữa, nên
+     * tên họ đứng một mình là đủ đặc trưng để chỉ cần 1 hit.
      *
-     * Sau khi có ContainsWord (khớp BIÊN TỪ), "conti" đứng riêng KHÔNG BAO GIỜ
-     * khớp "continue" nữa -> tên họ đứng một mình đã đủ đặc trưng.
+     * Danh sách gộp từ corpus thực tế (133 mục đầu) cộng thêm các họ cũ của
+     * RansomWall còn thiếu trong corpus — trong đó có akira và sodinokibi,
+     * hai họ chiếm 101/476 mẫu trong tập dữ liệu thực nghiệm của đồ án
+     * (Bảng 3.2.3): bỏ hai tên này sẽ làm F3 mất khả năng nhận theo tên cho
+     * đúng phần lớn dataset đang dùng để train/test.
      */
     inline const std::vector<std::string>& RansomFamilies() {
         static const std::vector<std::string> k = {
-            /* WannaCry */
-            "wncry", "wanacry", "wannacry", "wanacrypt", "wncryt",
-            /* Big families */
-            "conti", "ryuk", "revil", "sodinokibi", "lockbit", "blackcat",
-            "locky", "cerber", "darkside", "cryptolocker", "cryptowall",
-            "teslacrypt", "petya", "notpetya", "maze", "egregor", "clop",
-            "dharma", "phobos", "stop_djvu", "medusalocker", "avaddon",
-            "blackbasta", "royalransom", "akira", "8base",
-            /* Mới */
-            "alphv", "royal", "play", "bianlian", "rhysida",
-            "meow", "hunters", "scattered", "snatch", "monti",
-            /* Dharma variants — email trong tên file (chỉ các tên ĐẶC TRƯNG) */
-            "arrow", "bip", "combo", "gamma",
-            /* java và adobe bỏ — quá chung chung, SearchProtocolHost.exe cũng chứa */
-            /* Stop/DJVU variants */
-            "djvu", "neer", "nook", "maas", "kuus", "topi", "koom",
+            "abysslocker",
+            "ailock",
+            "alphv",
+            "antefrigus",
+            "atomsilo",
+            "auditteam",
+            "avaddon",
+            "avoslocker",
+            "bianlian",
+            "biglock",
+            "bitpaymer",
+            "bitransomware",
+            "blackbasta",
+            "blackbyte",
+            "blackfield",
+            "blackhunt",
+            "blacklock",
+            "blackmatter",
+            "blacksuit",
+            "blackwater",
+            "bluesky",
+            "bluewindgroup",
+            "booba",
+            "braincipher",
+            "bytesfromheaven",
+            "cerber",
+            "chilelocker",
+            "cicada3301",
+            "ciphbit",
+            "conti",
+            "crypto24",
+            "cryptomix",
+            "cryptxxx",
+            "crytox",
+            "ctblocker",
+            "cyberex",
+            "dagonlocker",
+            "darkangels",
+            "darkbit",
+            "darkpower",
+            "darkside",
+            "datacarry",
+            "deadbydawn",
+            "dennisthehitman",
+            "devman",
+            "diavol",
+            "direwolf",
+            "doppelpaymer",
+            "dragonforce",
+            "ech0raix",
+            "esxiargs",
+            "exitium",
+            "ftcode",
+            "gandcrab",
+            "gr33nbl00d",
+            "gunra",
+            "gwisinlocker",
+            "h0lygh0st",
+            "helldown",
+            "hellokitty",
+            "icefire",
+            "industrialspy",
+            "kairos",
+            "karakurt",
+            "kawalocker",
+            "killada",
+            "krybit",
+            "krypt",
+            "kuiper",
+            "lamashtu",
+            "lapiovra",
+            "leaknet",
+            "lockbit",
+            "luckbit",
+            "m3rx",
+            "magniber",
+            "makop",
+            "mallox",
+            "medusa",
+            "medusalocker",
+            "moneymessage",
+            "nefilim",
+            "nemty",
+            "netrunner",
+            "netwalker",
+            "nightspire",
+            "nokoyawa",
+            "novagroup",
+            "nullbulge",
+            "obscura",
+            "osiris_project",
+            "payoutsking",
+            "prolock",
+            "qilin",
+            "qlocker",
+            "quantumlocker",
+            "quicklock",
+            "ragnarlocker",
+            "ragnarok",
+            "ralord",
+            "rancoz",
+            "ransomexx",
+            "ransomhouse",
+            "ransomhub",
+            "ranzy",
+            "raworld",
+            "redalert",
+            "revil",
+            "rhysida",
+            "rtmlocker",
+            "ryuk",
+            "safepay",
+            "satancd",
+            "scarecrow",
+            "sensayq",
+            "sinobi",
+            "suncrypt",
+            "targetcompany",
+            "tengu",
+            "teslacrypt",
+            "thegentlemen",
+            "tommyleaks",
+            "trigona",
+            "u-bomb",
+            "vanhelsing",
+            "vicesociety",
+            "vohuk",
+            "wastedlocker",
+            "weaxor",
+            "whitelock",
+            "xleaks",
+            "xorist",
+            "yanluowang",
+            "wncry",
+            "wanacry",
+            "wannacry",
+            "wanacrypt",
+            "wncryt",
+            "sodinokibi",
+            "blackcat",
+            "locky",
+            "cryptolocker",
+            "cryptowall",
+            "petya",
+            "notpetya",
+            "maze",
+            "egregor",
+            "clop",
+            "dharma",
+            "phobos",
+            "stop_djvu",
+            "royalransom",
+            "akira",
+            "8base",
+            "royal",
+            "play",
+            "meow",
+            "hunters",
+            "scattered",
+            "snatch",
+            "monti",
+            "arrow",
+            "bip",
+            "combo",
+            "gamma",
+            "djvu",
+            "neer",
+            "nook",
+            "maas",
+            "kuus",
+            "topi",
+            "koom",
         };
         return k;
     }
@@ -559,13 +881,11 @@ namespace rw {
     /*
      * F6 — mảnh LỆNH, không phải từ đơn.
      *
-     * LỖI ĐÃ SỬA (dương tính giả trên DLL Microsoft đã ký):
-     *   Bản trước có "safeboot" đứng một mình -> khớp
-     *   api-ms-win-core-sysinfo-l1-2-0.dll (DLL Microsoft hợp lệ) -> F6 = 1.
-     *   "safeboot" là thuật ngữ Windows bình thường.
-     *
-     * Nguồn CHÍNH của F6 là command line tiến trình con (HandleProcessCreate).
-     * Quét chuỗi chỉ là tín hiệu phụ -> phải chặt.
+     * Không dùng từ đơn như "safeboot" đứng một mình: đó là thuật ngữ Windows
+     * bình thường và khớp cả api-ms-win-core-sysinfo-l1-2-0.dll (DLL
+     * Microsoft hợp lệ), gây dương tính giả. Nguồn CHÍNH của F6 là command
+     * line tiến trình con (HandleProcessCreate); quét chuỗi ở đây chỉ là tín
+     * hiệu phụ nên phải dùng cụm lệnh đặc trưng, không dùng từ đơn.
      */
     inline const std::vector<std::string>& SafeModePhrases() {
         static const std::vector<std::string> k = {
@@ -645,18 +965,17 @@ namespace rw {
         return false;
     }
 
-    /* ======================================================================
-       CHẠY CÔNG CỤ NGOÀI — có timeout THẬT
-       ======================================================================
-       LỖI v3.0:
-           while (ReadFile(hRead, ...)) { ... }
-           WaitForSingleObject(pi.hProcess, 5000);
-       ReadFile CHẶN cho tới khi pipe đóng. Nếu tool treo, ReadFile treo mãi mãi
-       và WaitForSingleObject(5000) không bao giờ được chạy tới.
-       "Timeout 5s" đó là ảo — thực tế treo vô hạn.
-
-       v4.0: PeekNamedPipe + deadline + TerminateProcess.
-       ====================================================================== */
+    /*
+     * CHẠY CÔNG CỤ NGOÀI — có timeout THẬT.
+     *
+     * Không được đọc pipe bằng ReadFile trong vòng lặp rồi chờ
+     * WaitForSingleObject(timeout) sau đó: ReadFile CHẶN cho tới khi pipe
+     * đóng, nên nếu tool con treo thì ReadFile treo mãi mãi và
+     * WaitForSingleObject không bao giờ được chạy tới — "timeout" kiểu đó là
+     * ảo, thực tế treo vô hạn. Phải dùng PeekNamedPipe để kiểm tra dữ liệu
+     * sẵn có trước khi đọc, kết hợp deadline theo GetTickCount64 và
+     * TerminateProcess khi hết hạn.
+     */
     inline std::wstring GetModuleDir() {
         wchar_t buf[MAX_PATH * 2] = {};
         GetModuleFileNameW(nullptr, buf, MAX_PATH * 2);
@@ -729,10 +1048,7 @@ namespace rw {
         return out;
     }
 
-    /* ======================================================================
-       DIE (Detect It Easy) — TUỲ CHỌN
-       Trả về: -1 không có tool | 0 không packed | 1 packed
-       ====================================================================== */
+    /* ---- DIE (Detect It Easy) — TUỲ CHỌN. Trả về: -1 không có tool | 0 không packed | 1 packed ---- */
     inline int RunDIE(const std::wstring& filePath) {
         std::wstring dir = GetModuleDir();
         std::wstring die = dir + cfg::DIE_REL_PATH;
@@ -768,17 +1084,16 @@ namespace rw {
         return 0;
     }
 
-    /* ======================================================================
-       FLOSS — TUỲ CHỌN nhưng QUAN TRỌNG
-       ======================================================================
-       Ransomware hiện đại DỰNG chuỗi ransom note TRÊN STACK lúc chạy —
-       chính là để né quét chuỗi tĩnh. Trong file .exe không hề có chuỗi
-       "your files have been encrypted", chỉ có một loạt lệnh
-       mov byte [rsp+N], 'y'  /  mov byte [rsp+N+1], 'o' ...
-
-       FLOSS mô phỏng thực thi để tái tạo chúng. ScanStrings native
-       KHÔNG THỂ làm việc này -> F3 sẽ miss đúng những mẫu tinh vi nhất.
-       ====================================================================== */
+    /*
+     * FLOSS — TUỲ CHỌN nhưng QUAN TRỌNG.
+     *
+     * Ransomware hiện đại dựng chuỗi ransom note trên STACK lúc chạy để né
+     * quét chuỗi tĩnh: trong file .exe không hề có chuỗi "your files have
+     * been encrypted", chỉ có một loạt lệnh kiểu
+     * mov byte [rsp+N], 'y' / mov byte [rsp+N+1], 'o' ... FLOSS mô phỏng
+     * thực thi để tái tạo các chuỗi đó; quét chuỗi tĩnh thông thường không
+     * làm được việc này nên sẽ miss đúng những mẫu tinh vi nhất.
+     */
     inline std::string RunFLOSS(const std::wstring& filePath) {
         std::wstring floss = GetModuleDir() + cfg::FLOSS_REL_PATH;
         if (!fs::exists(floss)) return "\x01NOTOOL";   /* sentinel: phân biệt "không có tool" vs "không thấy gì" */
@@ -787,15 +1102,14 @@ namespace rw {
         return ToLowerA(ExecuteAndCapture(cmd, cfg::FLOSS_TIMEOUT_MS));
     }
 
-    /* ======================================================================
-       ĐIỂM VÀO — chạy HOÀN TOÀN ngoài mutex
-       ======================================================================
-       Chiến lược: NATIVE trước (rẻ, ~ms), EXTERNAL sau (đắt, giây)
-       và CHỈ khi native miss. Native và external bù nhau:
-         - Native entropy/section: bắt packer LẠ mà DIE chưa biết
-         - DIE: bắt packer ĐÃ BIẾT chính xác hơn (database lớn)
-         - FLOSS: bóc chuỗi stack — native không làm được
-       ====================================================================== */
+    /*
+     * ĐIỂM VÀO — chạy HOÀN TOÀN ngoài mutex.
+     *
+     * Chiến lược: NATIVE trước (rẻ, ~ms), EXTERNAL sau (đắt, giây) và chỉ
+     * khi native miss. Native và external bù nhau: native entropy/section
+     * bắt packer LẠ mà DIE chưa biết, DIE bắt packer ĐÃ BIẾT chính xác hơn
+     * (database lớn), FLOSS bóc chuỗi trên stack mà native không làm được.
+     */
     inline StaticResult AnalyzeStatic(const std::wstring& path) {
         StaticResult r;
         LOG_I("[STATIC] Phan tich: %s", ws2s(path).c_str());
@@ -822,17 +1136,16 @@ namespace rw {
             r.safeModeStr = ScanSafeModeText(ascii, wide);
         }
 
-        /* ==================================================================
-           EXTERNAL: chậm (DIE 5s + FLOSS 20s) — CHỈ chạy khi ĐÃ có nghi ngờ
-           ==================================================================
-           LỖI ĐÃ SỬA (máy lag): bản cũ chạy DIE/FLOSS cho MỌI file, kể cả
-           svchost.exe/RuntimeBroker.exe của Microsoft. Windows đẻ hàng chục
-           tiến trình mỗi phút -> hàng chục DIE/FLOSS song song.
-           Trên ARM64 hai tool này là binary x64 chạy qua emulation -> càng chậm
-           -> timeout liên tục (thấy rõ trong log).
-
-           File có chữ ký hợp lệ và không có dấu hiệu nào -> bỏ qua external.
-           ================================================================== */
+        /*
+         * EXTERNAL: chậm (DIE 5s + FLOSS 20s) — CHỈ chạy khi đã có nghi ngờ.
+         *
+         * Không được chạy DIE/FLOSS cho mọi file: Windows tạo hàng chục tiến
+         * trình mỗi phút (kể cả svchost.exe, RuntimeBroker.exe của Microsoft),
+         * nên chạy vô điều kiện sẽ sinh hàng chục DIE/FLOSS song song. Trên
+         * ARM64 hai tool này là binary x64 chạy qua emulation nên càng chậm,
+         * dễ timeout liên tục. Vì vậy file có chữ ký hợp lệ và không có dấu
+         * hiệu nghi ngờ nào thì bỏ qua bước external.
+         */
         bool suspicious = r.unsignedImage || r.packed || r.cryptoApi || r.suspStrings;
 
         if (!suspicious) {

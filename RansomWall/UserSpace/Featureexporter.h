@@ -1,39 +1,24 @@
 /*
  * FeatureExport.h — Xuất feature ra CSV để train ML.
  *
- * ===========================================================================
- * NGUYÊN TẮC SỐ MỘT: KHÔNG ĐỤNG VÀO ĐƯỜNG NÓNG
- * ===========================================================================
- * Toàn bộ file này chỉ được gọi từ MaintenanceThread (tick 1 giây). Không có
- * hàm nào ở đây được phép gọi từ OnEvent, OnFirstTouch, hay bất kỳ chỗ nào
- * nằm trong ngân sách 200ms của driver.
+ * Nguyên tắc: file này chỉ được gọi từ MaintenanceThread (tick 1 giây), không
+ * bao giờ từ OnEvent/OnFirstTouch hay bất kỳ đường nào nằm trong ngân sách
+ * 200ms của driver. Ngay cả trong MaintenanceThread: chụp dữ liệu dưới lock
+ * thật nhanh, rồi định dạng + ghi file ngoài lock — giữ lock trong lúc ghi
+ * đĩa sẽ làm nghẽn cả hệ thống.
  *
- * Và ngay cả trong MaintenanceThread: CHỤP dữ liệu dưới lock thật nhanh, rồi
- * ĐỊNH DẠNG + GHI FILE ngoài lock. Giữ g_Mtx trong lúc ghi đĩa là cách chắc
- * chắn nhất để làm nghẽn cả hệ thống.
- *
- * ===========================================================================
- * GHI CHÚ VỀ DỮ LIỆU — đọc trước khi train
- * ===========================================================================
- *  1. Tách train/test THEO run_id, không phải theo dòng. Hai snapshot cách
- *     nhau 1 giây của cùng một lần chạy gần như giống hệt nhau; để chúng rơi
- *     vào cả train lẫn test thì accuracy sẽ đẹp một cách vô nghĩa.
- *
- *  2. Nhãn ở mức RUN, không phải mức dòng. Trong một lần chạy mẫu độc hại vẫn
- *     có hàng chục tiến trình sạch. Dùng cột is_target (khớp --target-name)
- *     để lọc, hoặc tự lọc theo image_sha256 trong pandas.
- *
- *  3. Ô TRỐNG = NaN, không phải 0. daa_min trống nghĩa là chưa từng tính được
- *     DAA cho tiến trình đó, khác hẳn với "đã tính và ra 0". Tương tự
- *     entropy_delta_mean. Đừng fillna(0) một cách máy móc.
- *
- *  4. f1..f14 là LATCH (đã từng bật), f9_now..f14_now là trạng thái trong cửa
- *     sổ 30 giây hiện tại. Có cả hai để lúc train thử được cả hai giả thuyết.
- *
- *  5. cow_files / cow_failed là MẶT NẠ HỢP LỆ cho f12/f13. Không có backup
- *     hoặc pre-metadata thì hai feature đó không thể bật, nên f13=0 lúc
- *     cow_files=0 mang nghĩa khác hẳn f13=0 lúc cow_files=50.
- * ===========================================================================
+ * Ghi chú khi dùng CSV này để train:
+ *  1. Tách train/test theo run_id, không theo dòng — hai snapshot cách nhau
+ *     1 giây của cùng một lần chạy gần như giống hệt nhau.
+ *  2. Nhãn ở mức RUN, không phải mức dòng: một lần chạy mẫu độc hại vẫn có
+ *     hàng chục tiến trình sạch. Lọc theo is_target hoặc image_sha256.
+ *  3. Ô trống = NaN, không phải 0 (vd daa_min, entropy_delta_mean trống nghĩa
+ *     là chưa từng tính được, khác với "đã tính và ra 0"). Đừng fillna(0).
+ *  4. f1..f14 là latch (đã từng bật), f9_now..f14_now là trạng thái trong cửa
+ *     sổ 30 giây hiện tại.
+ *  5. cow_files/cow_failed là mặt nạ hợp lệ cho f12/f13: không có backup thì
+ *     hai feature đó không thể bật, nên f13=0 lúc cow_files=0 khác nghĩa với
+ *     f13=0 lúc cow_files=50.
  */
 #pragma once
 

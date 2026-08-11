@@ -1,14 +1,9 @@
 /*
- * MLClient.h — Gọi ML engine.
+ * MLClient.h — Gọi ML engine qua WinHTTP.
  *
- * SỬA LỖI v3.0:
- *   1. _popen("curl ... -d @payload.json")
- *      - spawn cmd.exe MỖI LẦN gọi
- *      - ghi payload.json vào thư mục làm việc -> race khi nhiều PID gọi cùng lúc
- *      - chặn luồng gọi
- *      -> v4.0: WinHTTP, không file tạm, timeout 2s.
- *
- *   2. WinHTTP thay _popen: không file tạm, không race condition.
+ * Dùng WinHTTP trực tiếp thay vì spawn "curl" qua _popen: tránh phải ghi
+ * payload ra file tạm (race khi nhiều PID gọi đồng thời) và tránh chi phí
+ * spawn cmd.exe mỗi lần gọi.
  */
 #pragma once
 
