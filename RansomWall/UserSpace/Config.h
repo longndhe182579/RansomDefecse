@@ -155,6 +155,7 @@ namespace rw::cfg {
     constexpr int  ML_TIMEOUT_MS = 2000;
     constexpr int  ML_DEBOUNCE_MS = 500;
     constexpr int  ML_MIN_INTERVAL_MS = 1000;
+    constexpr int  ML_RETRY_INTERVAL_MS = 30000;   // khoang cach co dinh giua 2 lan goi lai khi Benign
 
     /* ---------- Công cụ ngoài (TUỲ CHỌN) ----------
        Đặt cạnh RansomWall.exe:

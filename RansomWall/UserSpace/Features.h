@@ -251,18 +251,17 @@ namespace rw {
             if (sinceLast < cfg::ML_MIN_INTERVAL_MS) return false;
 
             /*
-             * Theo dõi 90 giây sau khi ML phán benign, gọi lại ở +30s/+60s/+90s
-             * để cow_files và entropy_delta_mean kịp cập nhật trước khi phán
-             * quyết — ở lần gọi đầu (t~20s) CoW có thể chưa kịp backup đủ file
-             * nên các feature đó vẫn bằng 0. Phải kiểm tra trước
-             * if(!vectorDirty): sau lần gọi ML đầu tiên, F1-F14 thường đã bật
-             * hết nên Raise() không còn cơ hội set dirty lại, nếu để
-             * vectorDirty chặn thì lịch retry này không bao giờ chạy.
+             * Theo dõi thêm 90 giây sau khi ML phán benign, gọi lại cách đều
+             * mỗi 30 giây (lần 2 ở +30s, lần 3 ở +60s, lần 4 ở +90s tính từ
+             * lần gọi đầu) để backup_entries và entropy_delta_mean kịp cập
+             * nhật trước khi phán quyết — ở lần gọi đầu (t~20s) CoW có thể
+             * chưa kịp backup đủ file nên các feature đó vẫn bằng 0. Phải
+             * kiểm tra trước if(!vectorDirty): sau lần gọi ML đầu tiên, F1-F14
+             * thường đã bật hết nên Raise() không còn cơ hội set dirty lại,
+             * nếu để vectorDirty chặn thì lịch retry này không bao giờ chạy.
              */
-            if (ml.lastVerdict == Verdict::Benign) {
-                if (sinceLast >= 30000 && ml.callCount == 1) return true;
-                if (sinceLast >= 60000 && ml.callCount == 2) return true;
-                if (sinceLast >= 90000 && ml.callCount == 3) return true;
+            if (ml.lastVerdict == Verdict::Benign && ml.callCount < cfg::ML_MAX_SCHEDULED_CALLS) {
+                if (sinceLast >= cfg::ML_RETRY_INTERVAL_MS) return true;
             }
 
             if (!ml.vectorDirty) return false;
@@ -313,12 +312,9 @@ namespace rw {
                 .Num("entropy_delta_max",  entropyDeltaMax)
                 .Num("daa_min",            daaMin < 9000.0 ? daaMin : 0.0)
                 .UInt("entropy_samples",   (uint64_t)entropyDelta.n)
-                .UInt("cow_files",         cowFiles)
-                .UInt("cow_failed",        cowFailed)
                 .UInt("affected_ext_count",(uint64_t)affectedExts.size())
                 .Int("new_ext_max",        MaxNewExtCount())
                 .UInt("backup_entries",    (uint64_t)entries.size())
-                .UInt("quota_used",        quotaUsed)
                 .UInt("t_ms",              AgeMs())
                 .End();
             return j.Get();
