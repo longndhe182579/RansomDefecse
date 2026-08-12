@@ -530,6 +530,7 @@ static void CallML(DWORD pid) {
     MLResponse resp = g_ML.Predict(body);
 
     bool handleMalware = false, handleBenign = false;
+    int mlCallNo = 0;
     {
         std::lock_guard<std::mutex> lk(g_Mtx);
         auto it = g_Collector.find(pid);
@@ -537,6 +538,7 @@ static void CallML(DWORD pid) {
         auto& pf = it->second;
         pf.ml.inFlight = false;
         pf.ml.lastVerdict = resp.verdict;
+        mlCallNo = pf.ml.callCount;
 
         if (resp.verdict == Verdict::Malware && !pf.ml.verdictHandled) {
             pf.ml.verdictHandled = true;
@@ -559,17 +561,21 @@ static void CallML(DWORD pid) {
     }
 
     if (handleBenign) {
-        int curScore = ScoreOf(pid);
-
-        if (curScore < cfg::SCORE_FREEZE) {
-            LogMlBenign("[ML] BENIGN (conf=%.2f) PID=%lu score=%d -> unblock, xoa backup",
-                resp.confidence, pid, curScore);
+        /* Khong dung score de quyet dinh xoa backup: ML chi duoc goi khi
+           score >= SCORE_ML_TRIGGER(6), va score la chot mot chieu (khong
+           bao gio giam) -> curScore luon >= 6 >= SCORE_FREEZE(2) o day,
+           nhanh "score < SCORE_FREEZE" cu la code chet, khong bao gio dung.
+           Dung so lan goi ML lam tieu chi: du 4 lan Benign lien tiep moi
+           coi la sach that su va xoa backup; con lai giu nguyen cho lan sau. */
+        if (mlCallNo >= cfg::ML_MAX_SCHEDULED_CALLS) {
+            LogMlBenign("[ML] BENIGN (conf=%.2f) PID=%lu lan=%d -> du %d lan, xoa backup",
+                resp.confidence, pid, mlCallNo, cfg::ML_MAX_SCHEDULED_CALLS);
             if (g_Filter && g_Filter->IsConnected()) g_Filter->UndenyPid(pid);
             g_Clean->OnBenign(pid);
         }
         else {
-            LogMlBenign("[ML] BENIGN (conf=%.2f) PID=%lu score=%d — GIU BACKUP (score van cao)",
-                resp.confidence, pid, curScore);
+            LogMlBenign("[ML] BENIGN (conf=%.2f) PID=%lu lan=%d — GIU BACKUP (cho lan tiep theo)",
+                resp.confidence, pid, mlCallNo);
             if (g_Filter && g_Filter->IsConnected()) g_Filter->UndenyPid(pid);
         }
         return;

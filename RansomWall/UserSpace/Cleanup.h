@@ -130,7 +130,7 @@ namespace rw {
         }
 
         void ExitCleanupPass() {
-            struct Job { DWORD pid; uint64_t startTime; int score; };
+            struct Job { DWORD pid; uint64_t startTime; int score; bool keepManifest; };
             std::vector<Job> jobs;
             {
                 std::lock_guard<std::mutex> lk(mtx_);
@@ -147,7 +147,25 @@ namespace rw {
                         now - pf.exitedAt).count();
 
                     if (pf.totalScore >= cfg::SCORE_ML_TRIGGER) {
-                        /* GIỮ VÔ THỜI HẠN — chờ ML / chờ user */
+                        if (pf.ml.inFlight) {
+                            /* Cuoc goi ML dang chay do, khong dong vao -
+                               CallML tu xu ly khi co phan hoi ve. */
+                            ++it; continue;
+                        }
+                        if (pf.ml.lastVerdict == Verdict::Benign &&
+                            pf.ml.callCount >= 1 &&
+                            pf.ml.callCount < cfg::ML_MAX_SCHEDULED_CALLS) {
+                            /* Da co it nhat 1 lan Benign nhung chua du 4 lan
+                               thi process da thoat - khong con su kien moi
+                               nao de cho lich 30/60/90s nua, dung luon
+                               verdict da co, xoa backup ngay (giu manifest
+                               giong OnBenign) thay vi giu vo thoi han. */
+                            jobs.push_back({ pf.pid, pf.startTime, pf.totalScore, true });
+                            it = coll_.erase(it);
+                            continue;
+                        }
+                        /* Chua tung goi ML (callCount==0) hoac verdict=Malware/
+                           Unknown -> GIU VO THOI HAN, cho ML/user. */
                         ++it; continue;
                     }
                     if (pf.totalScore >= cfg::SCORE_FREEZE) {
@@ -159,13 +177,19 @@ namespace rw {
                          */
                         if (age < cfg::EXIT_GRACE_PERIOD_SEC) { ++it; continue; }
                     }
-                    jobs.push_back({ pf.pid, pf.startTime, pf.totalScore });
+                    jobs.push_back({ pf.pid, pf.startTime, pf.totalScore, false });
                     it = coll_.erase(it);
                 }
             }
             for (auto& j : jobs) {
-                Purge(j.pid, j.startTime, CleanupReason::ProcessExit);
-                LOG_D("[CLEAN-2] PID=%lu (score=%d) da thoat -> xoa backup.", j.pid, j.score);
+                if (j.keepManifest) {
+                    PurgeFilesKeepManifest(j.pid, j.startTime);
+                    LOG_D("[CLEAN-2] PID=%lu da thoat giua chung goi ML (score=%d) -> Benign, xoa backup.", j.pid, j.score);
+                }
+                else {
+                    Purge(j.pid, j.startTime, CleanupReason::ProcessExit);
+                    LOG_D("[CLEAN-2] PID=%lu (score=%d) da thoat -> xoa backup.", j.pid, j.score);
+                }
             }
         }
 

@@ -25,6 +25,7 @@ namespace rw::cfg {
     constexpr int SCORE_ML_TRIGGER = 6;   // gọi ML
     constexpr int SCORE_FREEZE = 2;   // đóng băng backup, tắt LRU
     constexpr int SCORE_CLEANUP_MAX = 1;   // <= giá trị này thì early cleanup được phép
+    constexpr int ML_MAX_SCHEDULED_CALLS = 4;   // đủ 4 lần Benign liên tiếp -> coi là sạch, xoá backup
 
     /* CoW: trần kích thước file backup, hai bậc theo score. Trần thấp (50MB)
        khi tiến trình còn sạch để tránh phình store; trần cao (512MB) khi đã
