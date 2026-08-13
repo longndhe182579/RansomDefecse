@@ -27,7 +27,7 @@ namespace rw {
         MLResponse Predict(const std::string& jsonBody) {
             MLResponse out;
 
-            HINTERNET session = WinHttpOpen(L"RansomWall/4.0",
+            HINTERNET session = WinHttpOpen(L"RansomDefense/4.0",
                 WINHTTP_ACCESS_TYPE_NO_PROXY,
                 WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
             if (!session) return out;

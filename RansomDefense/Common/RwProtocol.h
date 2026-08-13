@@ -27,11 +27,11 @@
 
 #pragma once
 
-#define RW_PORT_NAME        L"\\RansomWallPort"
+#define RW_PORT_NAME        L"\\RansomDefensePort"
 #define RW_MAX_PATH         520
 #define RW_MAX_CMDLINE      520
 
- /* Số client tối đa kết nối vào port (chỉ 1 = RansomWall.exe) */
+ /* Số client tối đa kết nối vào port (chỉ 1 = RansomDefense.exe) */
 #define RW_MAX_CONNECTIONS  1
 
 /* Timeout khi driver chờ user-space trả lời (đơn vị 100ns, số âm = relative) */
@@ -101,7 +101,7 @@ typedef struct _RW_REPLY {
    Command: user-space -> driver (qua FilterSendMessage)
    --------------------------------------------------------------------------- */
 typedef enum _RW_CMD_CODE {
-    RwCmdSetSelfPid = 1,   /* whitelist chính RansomWall.exe */
+    RwCmdSetSelfPid = 1,   /* whitelist chính RansomDefense.exe */
     RwCmdDenyPid = 2,   /* deny mọi IRP của PID này       */
     RwCmdUndenyPid = 3,
     RwCmdPauseCow = 4,   /* free disk < RESERVE -> fail-open, ngừng pend */

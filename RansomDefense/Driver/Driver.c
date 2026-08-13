@@ -1,9 +1,9 @@
 /*
- * Driver.c — RansomWall Kernel Minifilter
+ * Driver.c — RansomDefense Kernel Minifilter
  *
  * Chỉ hook thao tác GHI (write/rename/delete) là không đủ: một số họ
  * ransomware không ghi đè file gốc mà mở file CHỈ ĐỌC, mã hoá trong bộ nhớ,
- * ghi ra file mới với đuôi ngẫu nhiên (vd "RansomWall.pdb" -> "*.1bnp") rồi
+ * ghi ra file mới với đuôi ngẫu nhiên (vd "RansomDefense.pdb" -> "*.1bnp") rồi
  * xoá file gốc. Bước tạo file mới đi qua nhánh FILE_CREATE (được thả ngay vì
  * không có gì để cứu/bẫy), nên toàn bộ chuỗi này nằm ngoài tầm hook ghi và
  * honey file không bao giờ bị chạm tới.
@@ -427,9 +427,9 @@ static const PCWSTR gBlacklist[] = {
     L"\\WINDOWS\\SYSWOW64\\",
     L"\\WINDOWS\\BOOT\\",
     L"\\WINDOWS\\WINSXS\\",
-    L"\\RANSOMWALL_BACKUP",
-    L"\\RANSOMWALL_QUARANTINE",
-    L"\\RANSOMWALL_RESTORED",
+    L"\\RANSOMDEFENSE_BACKUP",
+    L"\\RANSOMDEFENSE_QUARANTINE",
+    L"\\RANSOMDEFENSE_RESTORED",
 };
 
 static BOOLEAN PathContainsCI(PCUNICODE_STRING Path, PCWSTR Needle) {

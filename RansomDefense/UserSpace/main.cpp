@@ -1,5 +1,5 @@
 /*
- * main.cpp — RansomWall User-Space Engine
+ * main.cpp — RansomDefense User-Space Engine
  *
  * Chế độ thu thập feature cho ML (--csv) chụp snapshot toàn bộ collector ra
  * CSV mỗi tick của MaintenanceThread — không gọi từ OnEvent để không đụng
@@ -113,7 +113,7 @@ static bool IsOwnTool(const std::wstring& imagePath) {
 
     std::wstring name = GetFileNameOnly(low);
     return name == L"diec.exe" || name == L"die.exe" ||
-        name == L"floss.exe" || name == L"ransomwall.exe";
+        name == L"floss.exe" || name == L"RansomDefense.exe";
 }
 
 static std::unique_ptr<CowEngine>     g_Cow;
@@ -459,7 +459,7 @@ static void HandleMalwareVerdict(DWORD pid, double conf) {
     Sleep(500);
 
     /* Ghi file signal KILLED de agent biet da kill thanh cong. Agent khong
-       doc duoc ransomwall.log (exclusive lock) nen dung file nay. */
+       doc duoc RansomDefense.log (exclusive lock) nen dung file nay. */
     {
         HANDLE hSig = CreateFileW(L"C:\\Windows\\rwlab\\out\\KILLED",
             GENERIC_WRITE, 0, nullptr,
@@ -502,14 +502,14 @@ static void HandleMalwareVerdict(DWORD pid, double conf) {
     LOG_A("   [3/4] KET QUA RESTORE: khoi phuc=%d  can xem lai=%d  xoa rac=%d",
         st.overwritten + st.missing, st.sidelined, cleaned);
 
-    std::wstring msg = L"RansomWall phat hien RANSOMWARE!\n\n"
+    std::wstring msg = L"RansomDefense phat hien RANSOMWARE!\n\n"
         L"PID: " + std::to_wstring(pid) + L"\n"
         L"Da khoi phuc: " + std::to_wstring(st.overwritten + st.missing) + L" file\n"
         L"Can ban xem lai: " + std::to_wstring(st.sidelined) + L" file\n"
         L"Da xoa " + std::to_wstring(cleaned) + L" file rac ma hoa\n\n"
         L"Bang chung da luu tai " + cfg::QUARANTINE_ROOT;
     LOG_I("   [4/4] Bao nguoi dung");
-    MessageBoxW(nullptr, msg.c_str(), L"RansomWall — MALWARE", MB_OK | MB_ICONSTOP);
+    MessageBoxW(nullptr, msg.c_str(), L"RansomDefense — MALWARE", MB_OK | MB_ICONSTOP);
 }
 
 /* ---- ML ---- */
@@ -1355,7 +1355,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--help" || a == L"-h" || a == L"/?") wantHelp = true;
     }
 
-    rw::Logger::I().SetLogFile(GetModuleDir() + L"\\ransomwall.log");
+    rw::Logger::I().SetLogFile(GetModuleDir() + L"\\RansomDefense.log");
 
     /*
      * Mức log tách riêng console và file: console chỉ hiện Info trở lên
@@ -1376,7 +1376,7 @@ int wmain(int argc, wchar_t** argv) {
 
     printf("\n");
     printf("  ==========================================\n");
-    printf("        RansomWall v4.5\n");
+    printf("        RansomDefense \n");
     printf("     CoW Engine + 14 Features + ML\n");
 #if RW_BYPASS_ML
     printf("     *** CHE DO BO QUA ML (score>=%d = KILL) ***\n", cfg::SCORE_ML_TRIGGER);
@@ -1466,7 +1466,7 @@ int wmain(int argc, wchar_t** argv) {
     else {
         g_DriverMode = false;
         LOG_W("[!] CHE DO SIMULATION — driver chua load.");
-        LOG_W("    De bat kernel mode:  sc start RansomWallDriver");
+        LOG_W("    De bat kernel mode:  sc start RansomDefenseDriver");
 
         for (auto& d : { Downloads(), Documents(), Desktop() })
             if (!d.empty()) std::thread(SimulationWatcher, d).detach();
@@ -1477,7 +1477,7 @@ int wmain(int argc, wchar_t** argv) {
 
     printf("\n");
     if (stopFile.empty()) {
-        LOG_I("=== RansomWall dang giam sat. Nhan Enter de thoat. ===");
+        LOG_I("=== RansomDefense dang giam sat. Nhan Enter de thoat. ===");
         printf("\n");
         (void)getchar();
     }
@@ -1492,7 +1492,7 @@ int wmain(int argc, wchar_t** argv) {
          */
         std::error_code ec;
         fs::remove(stopFile, ec);          /* xoa tin hieu cu neu con */
-        LOG_I("=== RansomWall dang giam sat. Cho tin hieu dung: %s ===",
+        LOG_I("=== RansomDefense dang giam sat. Cho tin hieu dung: %s ===",
             ws2s(stopFile).c_str());
         printf("\n");
         while (g_Running) {

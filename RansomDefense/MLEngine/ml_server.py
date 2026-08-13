@@ -1,12 +1,12 @@
 """
-ml_server.py -- Flask server nhan feature vector tu RansomWall (MLClient.h)
+ml_server.py -- Flask server nhan feature vector tu RansomDefense (MLClient.h)
 va tra ve verdict malware/benign.
 
 Chay trong Windows VM:
     pip install flask lightgbm joblib numpy
     python ml_server.py --model model_lgbm.pkl --port 5000
 
-RansomWall gui POST /predict voi JSON tu ToJson() (sau khi sua).
+RansomDefense gui POST /predict voi JSON tu ToJson() (sau khi sua).
 Server map ten field -> feature names cua model -> predict -> tra JSON.
 """
 

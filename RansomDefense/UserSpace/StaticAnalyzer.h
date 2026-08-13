@@ -483,7 +483,7 @@ namespace rw {
     /*
      * Cụm dài, đặc trưng — không thể trùng ngẫu nhiên. Danh sách gộp từ
      * corpus ransom note thực tế (140 mục đầu) cộng thêm các mục cũ của
-     * RansomWall (đuôi file/tên riêng đặc trưng — Dharma, LockBit,
+     * RansomDefense (đuôi file/tên riêng đặc trưng — Dharma, LockBit,
      * Stop/DJVU, Ryuk...) chưa có trong corpus.
      */
     inline const std::vector<std::string>& RansomPhrases() {
@@ -643,7 +643,7 @@ namespace rw {
      * tên họ đứng một mình là đủ đặc trưng để chỉ cần 1 hit.
      *
      * Danh sách gộp từ corpus thực tế (133 mục đầu) cộng thêm các họ cũ của
-     * RansomWall còn thiếu trong corpus — trong đó có akira và sodinokibi,
+     * RansomDefense còn thiếu trong corpus — trong đó có akira và sodinokibi,
      * hai họ chiếm 101/476 mẫu trong tập dữ liệu thực nghiệm của đồ án
      * (Bảng 3.2.3): bỏ hai tên này sẽ làm F3 mất khả năng nhận theo tên cho
      * đúng phần lớn dataset đang dùng để train/test.

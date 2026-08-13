@@ -16,10 +16,10 @@ namespace rw::cfg {
        để test logic, không phải bảo vệ thật. */
 
     /* ---------- Đường dẫn ---------- */
-    inline const std::wstring BACKUP_ROOT = L"C:\\RansomWall_Backup";
-    inline const std::wstring QUARANTINE_ROOT = L"C:\\RansomWall_Quarantine";
-    inline const std::wstring RESTORED_ROOT = L"C:\\RansomWall_Restored";
-    inline const std::wstring SESSION_FILE = L"C:\\RansomWall_Backup\\.session";
+    inline const std::wstring BACKUP_ROOT = L"C:\\RansomDefense_Backup";
+    inline const std::wstring QUARANTINE_ROOT = L"C:\\RansomDefense_Quarantine";
+    inline const std::wstring RESTORED_ROOT = L"C:\\RansomDefense_Restored";
+    inline const std::wstring SESSION_FILE = L"C:\\RansomDefense_Backup\\.session";
 
     /* ---------- Ngưỡng điểm ---------- */
     constexpr int SCORE_ML_TRIGGER = 6;   // gọi ML
@@ -158,7 +158,7 @@ namespace rw::cfg {
     constexpr int  ML_RETRY_INTERVAL_MS = 30000;   // khoang cach co dinh giua 2 lan goi lai khi Benign
 
     /* ---------- Công cụ ngoài (TUỲ CHỌN) ----------
-       Đặt cạnh RansomWall.exe:
+       Đặt cạnh RansomDefense.exe:
            <exe_dir>\die\diec.exe   +  <exe_dir>\die\db\
            <exe_dir>\floss.exe
        Không có thì tự động dùng phân tích PE thuần (native).

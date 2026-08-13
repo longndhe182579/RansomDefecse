@@ -488,7 +488,7 @@ namespace rw {
 
     /*
      * ProcessStartTime — chống PID reuse.
-     * Windows CẤP LẠI PID. C:\RansomWall_Backup\4812\ của Word đã chết
+     * Windows CẤP LẠI PID. C:\RansomDefense_Backup\4812\ của Word đã chết
      * có thể bị sample.exe kế thừa, kèm cả quota_used.
      * Cặp (PID, StartTime) là duy nhất trong toàn bộ vòng đời OS.
      */
@@ -509,9 +509,9 @@ namespace rw {
     }
 
     /*
-     * Cây tiến trình — chống đệ quy vô hạn: nếu RansomWall spawn một tiến
+     * Cây tiến trình — chống đệ quy vô hạn: nếu RansomDefense spawn một tiến
      * trình để quét nó, driver sẽ báo "process create" cho chính tiến trình
-     * đó, RansomWall lại phân tích và spawn để quét tiếp -> vòng lặp vô hạn.
+     * đó, RansomDefense lại phân tích và spawn để quét tiếp -> vòng lặp vô hạn.
      * conhost.exe cũng vậy: mỗi console app sinh một conhost.
      */
     inline DWORD GetParentPID(DWORD pid) {
@@ -529,7 +529,7 @@ namespace rw {
         return parent;
     }
 
-    /* Tiến trình này có phải hậu duệ của CHÍNH RansomWall không? */
+    /* Tiến trình này có phải hậu duệ của CHÍNH RansomDefense không? */
     inline bool IsDescendantOfSelf(DWORD pid, int maxDepth = 5) {
         DWORD self = GetCurrentProcessId();
         if (pid == self) return true;

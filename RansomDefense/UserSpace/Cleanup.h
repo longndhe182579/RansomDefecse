@@ -267,7 +267,7 @@ namespace rw {
                 /*
                  * NHÁNH QUAN TRỌNG NHẤT:
                  * session bị cắt giữa chừng + score >= 6
-                 * = ransomware nhiều khả năng đã KILL RansomWall rồi mã hoá tự do.
+                 * = ransomware nhiều khả năng đã KILL RansomDefense rồi mã hoá tự do.
                  * Backup còn lại là thứ DUY NHẤT cứu được dữ liệu.
                  * TUYỆT ĐỐI không dọn tự động.
                  */
@@ -298,11 +298,11 @@ namespace rw {
             }
 
             if (alerts > 0) {
-                std::wstring msg = L"RansomWall: phien truoc ket thuc bat thuong khi dang theo doi "
+                std::wstring msg = L"RansomDefense: phien truoc ket thuc bat thuong khi dang theo doi "
                     + std::to_wstring(alerts) + L" tien trinh dang ngo.\n"
                     L"Backup da duoc giu lai tai " + cfg::BACKUP_ROOT +
                     L"\nKiem tra du lieu cua ban.";
-                MessageBoxW(nullptr, msg.c_str(), L"RansomWall — Canh bao khoi dong",
+                MessageBoxW(nullptr, msg.c_str(), L"RansomDefense — Canh bao khoi dong",
                     MB_OK | MB_ICONWARNING);
             }
             LOG_I("[CLEAN-4] Orphan sweep: giu=%d  xoa=%d  quarantine=%d  canh bao=%d",
