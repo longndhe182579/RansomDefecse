@@ -1,186 +1,274 @@
-"""
-ml_server.py -- Flask server nhan feature vector tu RansomDefense (MLClient.h)
-va tra ve verdict malware/benign.
+"""Flask inference server for RansomDefense GTB/LightGBM bundles.
 
-Chay trong Windows VM:
-    pip install flask lightgbm joblib numpy
-    python ml_server.py --model model_lgbm.pkl --port 5000
+Deployment files placed in this directory:
+    model.joblib
+    metadata.json
 
-RansomDefense gui POST /predict voi JSON tu ToJson() (sau khi sua).
-Server map ten field -> feature names cua model -> predict -> tra JSON.
+The decision threshold, ordered features and preprocessing are loaded from the
+trained artifact. No probability threshold is hard-coded in this server.
+Only load joblib files produced by a trusted training pipeline.
 """
+
+from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import logging
-import numpy as np
-from flask import Flask, request, jsonify
+from pathlib import Path
+from typing import Any
+
 import joblib
+import numpy as np
+import pandas as pd
+from flask import Flask, jsonify, request
+
 
 app = Flask(__name__)
-model = None
-FEATURES = None
+MODEL: Any = None
+IMPUTER: Any = None
+FEATURES: list[str] = []
+THRESHOLD: float | None = None
+MODEL_NAME = "unknown"
+MODEL_PATH: Path | None = None
+METADATA_PATH: Path | None = None
 
-# Map tu ten field trong ToJson() -> ten feature trong model
 FIELD_MAP = {
-    "unsigned":           "f1_unsigned",
-    "packed":             "f2_packed",
+    "unsigned": "f1_unsigned",
+    "packed": "f2_packed",
     "suspicious_strings": "f3_susp_strings",
-    "honey_modified":     "f4_honey",
-    "crypto_api":         "f5_crypto_api",
-    "safe_mode_disable":  "f6_safe_mode",
-    "shadow_deleted":     "f7_shadow_del",
-    "registry_persist":   "f8_reg_persist",
-    "dir_enum":           "f9_dir_enum",
-    "high_io":            "f10_high_io",
-    "ext_changed":        "f11_ext_changed",
-    "fingerprint_mismatch":"f12_fingerprint",
-    "high_entropy":       "f13_entropy",
-    "daa_encrypted":      "f14_daa",
-    # Continuous features
-    "io_rate":            "io_rate",
-    "rename_rate":        "rename_rate",
-    "dirent_rate":        "dirent_rate",
+    "honey_modified": "f4_honey",
+    "crypto_api": "f5_crypto_api",
+    "safe_mode_disable": "f6_safe_mode",
+    "shadow_deleted": "f7_shadow_del",
+    "registry_persist": "f8_reg_persist",
+    "dir_enum": "f9_dir_enum",
+    "high_io": "f10_high_io",
+    "ext_changed": "f11_ext_changed",
+    "fingerprint_mismatch": "f12_fingerprint",
+    "high_entropy": "f13_entropy",
+    "daa_encrypted": "f14_daa",
+    "io_rate": "io_rate",
+    "rename_rate": "rename_rate",
+    "dirent_rate": "dirent_rate",
     "entropy_delta_mean": "entropy_delta_mean",
-    "entropy_delta_max":  "entropy_delta_max",
-    "entropy_samples":    "entropy_samples",
-    "daa_min":            "daa_min",
+    "entropy_delta_max": "entropy_delta_max",
+    "entropy_samples": "entropy_samples",
+    "daa_min": "daa_min",
     "affected_ext_count": "affected_ext_count",
-    "new_ext_max":        "new_ext_max",
-    "backup_entries":     "backup_entries",
-    "t_ms":               "t_ms",
+    "new_ext_max": "new_ext_max",
+    "backup_entries": "backup_entries",
+    "t_ms": "t_ms",
 }
 
-THRESHOLD = 0.845  # nguong predict malware
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def metadata_file_for(model_path: Path, explicit: str | None) -> Path:
+    candidates = []
+    if explicit:
+        candidates.append(Path(explicit).resolve())
+    candidates.extend([
+        model_path.parent / "metadata.json",
+        model_path.with_suffix(".json"),
+    ])
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        "Metadata JSON not found. Copy metadata.json beside model.joblib "
+        "or pass --metadata <path>."
+    )
+
+
+def _feature_list(value: Any, source: str) -> list[str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or not value or not all(isinstance(x, str) and x for x in value):
+        raise TypeError(f"Invalid feature list in {source}")
+    if len(value) != len(set(value)):
+        raise ValueError(f"Duplicate feature names in {source}")
+    return value
+
+
+def _numeric_threshold(value: Any, source: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"Invalid threshold in {source}: {value!r}")
+    result = float(value)
+    if not 0.0 < result < 1.0:
+        raise ValueError(f"Threshold from {source} must be between 0 and 1")
+    return result
+
+
+def load_artifacts(model_file: str, metadata_file: str | None = None) -> dict:
+    """Load and validate model, preprocessing, feature order and OOF threshold."""
+    global MODEL, IMPUTER, FEATURES, THRESHOLD, MODEL_NAME, MODEL_PATH, METADATA_PATH
+
+    model_path = Path(model_file).resolve()
+    if not model_path.is_file():
+        raise FileNotFoundError(f"Model not found: {model_path}")
+    metadata_path = metadata_file_for(model_path, metadata_file)
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
+    if not isinstance(metadata, dict):
+        raise TypeError("metadata.json must contain a JSON object")
+
+    expected_hash = str(metadata.get("bundle_sha256", "")).strip().lower()
+    actual_hash = sha256(model_path)
+    if expected_hash and expected_hash != actual_hash:
+        raise ValueError(
+            f"Model SHA-256 mismatch: metadata={expected_hash}, actual={actual_hash}"
+        )
+
+    loaded = joblib.load(model_path)
+    bundle = loaded if isinstance(loaded, dict) else {}
+    classifier = loaded
+    if bundle:
+        classifier = bundle.get("model")
+        if classifier is None:
+            for key in ("classifier", "clf", "estimator", "lgbm", "booster"):
+                if bundle.get(key) is not None:
+                    classifier = bundle[key]
+                    break
+    if classifier is None or not hasattr(classifier, "predict_proba"):
+        raise TypeError("Loaded artifact does not contain a classifier with predict_proba")
+
+    imputer = bundle.get("imputer") if bundle else None
+    metadata_features = _feature_list(metadata.get("features"), "metadata.json")
+    bundle_features = _feature_list(bundle.get("features"), "model bundle") if bundle else None
+    if metadata_features and bundle_features and metadata_features != bundle_features:
+        raise ValueError("Feature order differs between model bundle and metadata.json")
+    features = metadata_features or bundle_features
+    if not features:
+        raise ValueError("Feature order is missing from both model bundle and metadata.json")
+    declared_count = metadata.get("feature_count")
+    if declared_count is not None and int(declared_count) != len(features):
+        raise ValueError("feature_count does not match the feature list")
+
+    metadata_threshold = _numeric_threshold(metadata.get("threshold"), "metadata.json")
+    bundle_threshold = _numeric_threshold(bundle.get("threshold"), "model bundle") if bundle else None
+    if metadata_threshold is not None and bundle_threshold is not None and not np.isclose(
+        metadata_threshold, bundle_threshold, atol=1e-12
+    ):
+        raise ValueError("Threshold differs between model bundle and metadata.json")
+    threshold = metadata_threshold if metadata_threshold is not None else bundle_threshold
+    if threshold is None:
+        raise ValueError("Optimized threshold is missing from model bundle and metadata.json")
+
+    MODEL = classifier
+    IMPUTER = imputer
+    FEATURES = features
+    THRESHOLD = threshold
+    MODEL_NAME = str(metadata.get("model_name") or bundle.get("model_name") or type(classifier).__name__)
+    MODEL_PATH = model_path
+    METADATA_PATH = metadata_path
+    return {
+        "model_name": MODEL_NAME,
+        "features": len(FEATURES),
+        "threshold": THRESHOLD,
+        "model_sha256": actual_hash,
+        "model_path": str(MODEL_PATH),
+        "metadata_path": str(METADATA_PATH),
+        "imputer_loaded": IMPUTER is not None,
+    }
+
+
+def payload_frame(data: dict) -> pd.DataFrame:
+    row: dict[str, float] = {}
+    for source, feature in FIELD_MAP.items():
+        raw = data.get(source, data.get(feature))
+        if raw is None or raw == "":
+            row[feature] = np.nan
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Feature {source!r} is not numeric: {raw!r}") from exc
+        if not np.isfinite(value):
+            row[feature] = np.nan
+        else:
+            row[feature] = value
+
+    # Runtime uses zero when these measurements are not available. Training CSV
+    # represents the same state as missing, so restore NaN before train-fitted imputation.
+    if row.get("entropy_samples", 0.0) <= 0:
+        row["entropy_delta_mean"] = np.nan
+    if row.get("daa_min", 0.0) <= 0 or row.get("daa_min", 0.0) > 1000:
+        row["daa_min"] = np.nan
+
+    missing_contract = sorted(set(FEATURES) - set(row))
+    if missing_contract:
+        raise ValueError(f"Server has no payload mapping for model features: {missing_contract}")
+    return pd.DataFrame([[row[name] for name in FEATURES]], columns=FEATURES, dtype=float)
 
 
 @app.route("/predict", methods=["POST"])
 def predict():
+    if MODEL is None or THRESHOLD is None:
+        return jsonify({"verdict": "unknown", "confidence": 0.0, "error": "model not loaded"}), 503
     try:
         data = request.get_json(force=True)
-        if not data:
-            return jsonify({"verdict": "unknown", "confidence": 0.0,
-                            "error": "empty body"}), 400
-
-        row = {}
-        for src, dst in FIELD_MAP.items():
-            v = data.get(src, data.get(dst, 0))
-            try:
-                row[dst] = float(v)
-            except (TypeError, ValueError):
-                row[dst] = 0.0
-
-        # Daa_min: gia tri sentinel 9999 nghia la chua tinh duoc -> dat 0
-        if row.get("daa_min", 0) > 1000:
-            row["daa_min"] = 0.0
-
-        # Thu tu cot phai khop FEATURES cua model
-        X = np.array([[row.get(f, 0.0) for f in FEATURES]], dtype=np.float32)
-
-        prob = float(model.predict_proba(X)[0][1])
-        verdict = "malware" if prob >= THRESHOLD else "benign"
-
-        logging.info("PID=%s score=%s prob=%.3f -> %s",
-                     data.get("pid", "?"), data.get("total_score", "?"),
-                     prob, verdict)
-
+        if not isinstance(data, dict) or not data:
+            return jsonify({"verdict": "unknown", "confidence": 0.0, "error": "empty body"}), 400
+        frame = payload_frame(data)
+        values = IMPUTER.transform(frame) if IMPUTER is not None else frame
+        probability = float(MODEL.predict_proba(values)[0][1])
+        verdict = "malware" if probability >= THRESHOLD else "benign"
+        logging.info(
+            "model=%s pid=%s score=%s probability=%.6f threshold=%.6f verdict=%s",
+            MODEL_NAME, data.get("pid", "?"), data.get("total_score", "?"),
+            probability, THRESHOLD, verdict,
+        )
         return jsonify({
-            "verdict":    verdict,
-            "confidence": round(prob, 4),
-            "threshold":  THRESHOLD,
+            "verdict": verdict,
+            "confidence": round(probability, 6),
+            "threshold": THRESHOLD,
+            "model": MODEL_NAME,
         })
-
-    except Exception as e:
-        logging.exception("Predict error")
-        return jsonify({"verdict": "unknown", "confidence": 0.0,
-                        "error": str(e)}), 500
+    except ValueError as exc:
+        return jsonify({"verdict": "unknown", "confidence": 0.0, "error": str(exc)}), 400
+    except Exception as exc:
+        logging.exception("Prediction error")
+        return jsonify({"verdict": "unknown", "confidence": 0.0, "error": str(exc)}), 500
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "features": len(FEATURES)})
+    ready = MODEL is not None and THRESHOLD is not None and bool(FEATURES)
+    return jsonify({
+        "status": "ok" if ready else "not_ready",
+        "model_loaded": ready,
+        "model": MODEL_NAME,
+        "features": len(FEATURES),
+        "threshold": THRESHOLD,
+        "imputer_loaded": IMPUTER is not None,
+        "model_path": str(MODEL_PATH) if MODEL_PATH else None,
+        "metadata_path": str(METADATA_PATH) if METADATA_PATH else None,
+    }), 200 if ready else 503
 
 
-def main():
-    global model, FEATURES, THRESHOLD
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default="model.joblib")
+    parser.add_argument("--metadata", default=None)
+    parser.add_argument("--port", type=int, default=5000)
+    parser.add_argument("--host", default="127.0.0.1")
+    args = parser.parse_args()
 
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--model",     default="model_lgbm.pkl")
-    ap.add_argument("--port",      type=int, default=5000)
-    ap.add_argument("--threshold", type=float, default=0.845)
-    ap.add_argument("--host",      default="127.0.0.1")
-    args = ap.parse_args()
-
-    THRESHOLD = args.threshold
-
-    print(f"[ML] Load model: {args.model}")
-    model = joblib.load(args.model)
-
-    # Mot so pipeline train luu ca goi (dict) gom model + metadata thay vi
-    # luu thang classifier -> model.predict_proba se fail o MOI request.
-    # Do tim va bung ra ngay luc khoi dong, khong de loi lap lai lang le
-    # tren tung du doan (mat ca luot test moi phat hien duoc).
-    bundle_keys = None
-    if isinstance(model, dict):
-        bundle_keys = list(model.keys())
-        found = None
-        for key in ("model", "classifier", "clf", "estimator", "lgbm", "booster"):
-            candidate = model.get(key)
-            if candidate is not None and hasattr(candidate, "predict_proba"):
-                found = key
-                break
-        if found is None:
-            raise TypeError(
-                f"[ML] '{args.model}' la dict nhung khong tim thay classifier "
-                f"hop le (can co .predict_proba). Cac key co san: {bundle_keys}. "
-                f"Sua lai cach luu model (joblib.dump(classifier, ...)) hoac "
-                f"bao ten key dung de cap nhat danh sach do tim trong ml_server.py."
-            )
-        print(f"[ML] '{args.model}' la dict, lay classifier tu key '{found}'")
-        # Neu bundle co san danh sach features thi dung luon, uu tien hon
-        # ca file .json canh ben (nguoi train co the da nhet thang vao day).
-        if isinstance(model.get("features"), list) and model["features"]:
-            FEATURES = model["features"]
-            print(f"[ML] Features tu trong bundle: {len(FEATURES)}")
-        if isinstance(model.get("threshold"), (int, float)):
-            THRESHOLD = float(model["threshold"])
-            print(f"[ML] Nguong lay tu trong bundle: {THRESHOLD}")
-        model = model[found]
-
-    if not hasattr(model, "predict_proba"):
-        raise TypeError(
-            f"[ML] '{args.model}' load ra kieu {type(model)}, khong co "
-            f"predict_proba. Kiem tra lai file model."
-        )
-
-    import json, pathlib
-    json_path = pathlib.Path(args.model).with_suffix(".json")
-    if FEATURES:
-        pass  # da lay duoc tu trong bundle o tren, khong doc file .json nua
-    elif json_path.exists():
-        info = json.loads(json_path.read_text())
-        FEATURES = info.get("features", [])
-        print(f"[ML] Features tu model.json: {len(FEATURES)}")
-    else:
-        # Fallback: dung danh sach mac dinh
-        FEATURES = [
-            "f1_unsigned","f2_packed","f3_susp_strings","f4_honey",
-            "f5_crypto_api","f6_safe_mode","f7_shadow_del","f8_reg_persist",
-            "f9_dir_enum","f10_high_io","f11_ext_changed","f12_fingerprint",
-            "f13_entropy","f14_daa",
-            "io_rate","rename_rate","dirent_rate",
-            "entropy_delta_mean","entropy_delta_max","entropy_samples",
-            "daa_min","cow_files","cow_failed",
-            "affected_ext_count","new_ext_max",
-            "backup_entries","quota_used","t_ms",
-        ]
-        print(f"[ML] Dung features mac dinh: {len(FEATURES)}")
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s"
-    )
-    print(f"[ML] Server tai http://{args.host}:{args.port}/predict")
-    print(f"[ML] Nguong malware: {THRESHOLD}")
+    loaded = load_artifacts(args.model, args.metadata)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    print(f"[ML] Model: {loaded['model_name']}")
+    print(f"[ML] Features: {loaded['features']}")
+    print(f"[ML] Optimized threshold: {loaded['threshold']}")
+    print(f"[ML] Imputer loaded: {loaded['imputer_loaded']}")
+    print(f"[ML] Server: http://{args.host}:{args.port}/predict")
     app.run(host=args.host, port=args.port, threaded=True)
 
 

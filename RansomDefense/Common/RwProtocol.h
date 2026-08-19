@@ -105,12 +105,14 @@ typedef enum _RW_CMD_CODE {
     RwCmdDenyPid = 2,   /* deny mọi IRP của PID này       */
     RwCmdUndenyPid = 3,
     RwCmdPauseCow = 4,   /* free disk < RESERVE -> fail-open, ngừng pend */
-    RwCmdResumeCow = 5
+    RwCmdResumeCow = 5,
+    RwCmdClearTouch = 6
 } RW_CMD_CODE;
 
 #pragma pack(push, 8)
 typedef struct _RW_COMMAND {
     unsigned long Code;    /* RW_CMD_CODE */
     unsigned long Pid;
+    long long FileRef;
 } RW_COMMAND, * PRW_COMMAND;
 #pragma pack(pop)
