@@ -143,28 +143,53 @@ static int ScoreOf(DWORD pid) {
 
 static bool IsCriticalSystemProcess(const std::wstring& imagePath) {
     std::wstring n = ToLower(GetFileNameOnly(imagePath));
-    bool nameMatch = n == L"explorer.exe" || n == L"svchost.exe" ||
-        n == L"services.exe" || n == L"lsass.exe" ||
-        n == L"winlogon.exe" || n == L"csrss.exe" ||
-        n == L"wininit.exe" || n == L"smss.exe" ||
-        n == L"dwm.exe" || n == L"taskhostw.exe";
-    if (!nameMatch) return false;
-
-    /* Tên trùng KHÔNG đủ — ransomware tự đặt tên "svchost.exe" chạy ngoài
-       System32 để lợi dụng đúng bộ lọc này, nên phải xác nhận đường dẫn
-       nằm trong thư mục hệ thống thật, không chỉ trùng tên file.
-       Log thực tế: PID=15348 giả mạo "svchost.exe" ngoài System32 (score=6)
-       từng lọt qua vì code cũ chỉ so tên. */
     std::wstring low = ToLower(imagePath);
-    bool inSystemDir =
-        low.find(L"\\windows\\system32\\") != std::wstring::npos ||
-        low.find(L"\\windows\\syswow64\\") != std::wstring::npos;
-    if (!inSystemDir) {
-        LOG_W("[!] Ten trung he thong nhung SAI DUONG DAN (gia mao): %s",
-            ws2s(imagePath).c_str());
-        return false;
+ 
+    static const std::wstring sysRoot = [] {
+        wchar_t buf[MAX_PATH]{};
+        UINT len = GetWindowsDirectoryW(buf, MAX_PATH);
+        std::wstring r = (len > 0 && len < MAX_PATH) ? buf : L"C:\\Windows";
+        if (!r.empty() && r.back() != L'\\') r += L'\\';
+        return ToLower(r);
+        }();
+    static const std::wstring sys32 = sysRoot + L"system32\\";
+    static const std::wstring sysWow64 = sysRoot + L"syswow64\\";
+ 
+    /* Mỗi tên tiến trình chỉ được coi là hệ thống nếu nằm ĐÚNG thư mục
+       của nó — không dùng chung một danh sách thư mục cho tất cả. */
+    struct SysProc { const wchar_t* name; bool inRootOnly; };
+    static const SysProc kSysProcs[] = {
+        { L"explorer.exe",   true  },  /* %SystemRoot%\explorer.exe        */
+        { L"svchost.exe",    false },  /* %SystemRoot%\System32\svchost.exe (hoặc SysWOW64) */
+        { L"services.exe",   false },
+        { L"lsass.exe",      false },
+        { L"winlogon.exe",   false },
+        { L"csrss.exe",      false },
+        { L"wininit.exe",    false },
+        { L"smss.exe",       false },
+        { L"dwm.exe",        false },
+        { L"taskhostw.exe",  false },
+    };
+ 
+    for (auto& sp : kSysProcs) {
+        if (n != sp.name) continue;
+ 
+        bool ok = sp.inRootOnly
+            ? InSystemDir(low, sysRoot) && !InSystemDir(low, sys32) && !InSystemDir(low, sysWow64)
+            : InSystemDir(low, sys32) || InSystemDir(low, sysWow64);
+ 
+        /* Tên trùng KHÔNG đủ — ransomware tự đặt tên "svchost.exe" chạy
+           ngoài System32 để lợi dụng đúng bộ lọc này, nên phải xác nhận
+           đường dẫn nằm trong thư mục hệ thống thật, không chỉ trùng tên.
+           Log thực tế: PID=15348 giả mạo "svchost.exe" ngoài System32
+           (score=6) từng lọt qua vì code cũ chỉ so tên. */
+        if (!ok) {
+            LOG_W("[!] Ten trung he thong nhung SAI DUONG DAN (gia mao): %s",
+                ws2s(imagePath).c_str());
+        }
+        return ok;
     }
-    return true;
+    return false;
 }
 
 /*
