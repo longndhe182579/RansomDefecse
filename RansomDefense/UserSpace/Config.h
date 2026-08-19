@@ -22,7 +22,7 @@ namespace rw::cfg {
     inline const std::wstring SESSION_FILE = L"C:\\RansomDefense_Backup\\.session";
 
     /* ---------- Ngưỡng điểm ---------- */
-    constexpr int SCORE_ML_TRIGGER = 4;   // gọi ML
+    constexpr int SCORE_ML_TRIGGER = 2;   // gọi ML
     constexpr int SCORE_FREEZE = 2;   // đóng băng backup, tắt LRU
     constexpr int SCORE_CLEANUP_MAX = 1;   // <= giá trị này thì early cleanup được phép
     constexpr int ML_MAX_SCHEDULED_CALLS = 4;   // đủ 4 lần Benign liên tiếp -> coi là sạch, xoá backup
