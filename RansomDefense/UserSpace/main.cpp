@@ -141,6 +141,14 @@ static int ScoreOf(DWORD pid) {
     return (it != g_Collector.end()) ? it->second.totalScore : 0;
 }
 
+static bool InSystemDir(const std::wstring& lowPath, const std::wstring& lowDir) {
+    /* So PREFIX, không phải "chứa chuỗi con" (find()) — find() sẽ khớp
+       nhầm C:\Evil\windows\system32\fake.exe vì chuỗi "\windows\system32\"
+       vẫn xuất hiện đâu đó giữa đường dẫn giả mạo. */
+    return lowPath.size() > lowDir.size() &&
+        lowPath.compare(0, lowDir.size(), lowDir) == 0;
+}
+
 static bool IsCriticalSystemProcess(const std::wstring& imagePath) {
     std::wstring n = ToLower(GetFileNameOnly(imagePath));
     std::wstring low = ToLower(imagePath);
